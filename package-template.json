@@ -1,0 +1,14 @@
+{
+  "deptIdEnc": "",
+  "scheduleAt": "22:00",
+  "reserve": [
+    {
+      "username": "",
+      "password": "",
+      "time": ["11:00", "15:00"],
+      "roomid": "",
+      "seatid": [],
+      "daysofweek": []
+    }
+  ]
+}

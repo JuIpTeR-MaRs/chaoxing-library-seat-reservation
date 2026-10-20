@@ -103,6 +103,8 @@ celerybeat.pid
 
 # Environments
 .env
+config.local.json
+last-run.log
 .venv
 env/
 venv/
