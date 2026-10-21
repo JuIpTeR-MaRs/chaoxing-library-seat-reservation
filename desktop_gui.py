@@ -268,7 +268,7 @@ class SeatApp(tk.Tk):
         self.schedule_status = tk.StringVar(value="点击“刷新任务状态”查看下一次运行时间。")
         ttk.Label(schedule_tab, text="任务状态", style="Section.TLabel").pack(anchor="w", pady=(10, 5))
         ttk.Label(schedule_tab, textvariable=self.schedule_status, justify="left", style="Surface.TLabel").pack(anchor="w")
-        ttk.Label(schedule_tab, text="主方案全部失败才尝试备选；部分成功则停止。单次最多 4 小时，运行结果保存在 last-run.log。",
+        ttk.Label(schedule_tab, text="已成功时段会保留；备选方案只补主方案目标内的空缺。单次最多 4 小时，结果见 last-run.log。",
                   style="SurfaceHint.TLabel").pack(anchor="w", pady=(12, 0))
 
         self.status = tk.StringVar(value="就绪")
@@ -613,7 +613,7 @@ class SeatApp(tk.Tk):
         body = ttk.Frame(dialog, padding=18)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="备选方案", style="Eyebrow.TLabel").pack(anchor="w")
-        ttk.Label(body, text="主方案全部失败后，按列表顺序尝试；有任何时段成功就停止。",
+        ttk.Label(body, text="按顺序补主方案未成功的时段；不会重复提交已成功或目标范围外的时段。",
                   style="Hint.TLabel").pack(anchor="w", pady=(4, 12))
 
         table = ttk.Treeview(body, columns=("order", "room", "seat", "time"), show="headings", height=6, selectmode="browse")

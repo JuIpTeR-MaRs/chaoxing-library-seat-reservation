@@ -44,6 +44,31 @@ def reservation_plans(user, overrides=None):
     return plans
 
 
+def time_minutes(value):
+    parsed = dt.datetime.strptime(value, "%H:%M")
+    return parsed.hour * 60 + parsed.minute
+
+
+def uncovered_segments(start, end, covered):
+    """Split the unreserved part of one time window into slots up to four hours."""
+    beginning, ending = time_minutes(start), time_minutes(end)
+    cursor = beginning
+    gaps = []
+    for booked_start, booked_end in sorted(covered):
+        if booked_end <= cursor or booked_start >= ending:
+            continue
+        if booked_start > cursor:
+            gaps.append((cursor, min(booked_start, ending)))
+        cursor = max(cursor, min(booked_end, ending))
+        if cursor >= ending:
+            break
+    if cursor < ending:
+        gaps.append((cursor, ending))
+    return [segment for gap_start, gap_end in gaps
+            for segment in build_segments(f"{gap_start // 60:02d}:{gap_start % 60:02d}",
+                                          f"{gap_end // 60:02d}:{gap_end % 60:02d}")]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-u", "--user", required=True)
@@ -97,9 +122,17 @@ def main():
         return response
 
     client.requests.post = capture_submit
+    target_start = plans[0]["segments"][0][0]
+    target_end = plans[0]["segments"][-1][1]
+    covered = []
     for plan in plans:
-        succeeded = 0
-        for start, end in plan["segments"]:
+        window_start = max(time_minutes(target_start), time_minutes(plan["segments"][0][0]))
+        window_end = min(time_minutes(target_end), time_minutes(plan["segments"][-1][1]))
+        if window_start >= window_end:
+            continue
+        start_text = f"{window_start // 60:02d}:{window_start % 60:02d}"
+        end_text = f"{window_end // 60:02d}:{window_end % 60:02d}"
+        for start, end in uncovered_segments(start_text, end_text, covered):
             client.max_attempt = 2
             submit_response = None
             try:
@@ -127,12 +160,14 @@ def main():
                     "error": type(error).__name__,
                 }
             print(json.dumps(result, ensure_ascii=True), flush=True)
-            succeeded += result["success"]
-        if succeeded:
-            if succeeded < len(plan["segments"]):
-                print(json.dumps({"plan": plan["plan"], "status": "partial_success", "backups_skipped": True}), flush=True)
-                return 1
+            if result["success"]:
+                covered.append((time_minutes(start), time_minutes(end)))
+        if not uncovered_segments(target_start, target_end, covered):
+            print(json.dumps({"status": "complete", "target": [target_start, target_end]}), flush=True)
             return 0
+    missing = uncovered_segments(target_start, target_end, covered)
+    print(json.dumps({"status": "partial_success" if covered else "failed",
+                      "target": [target_start, target_end], "missing": missing}), flush=True)
     return 1
 
 

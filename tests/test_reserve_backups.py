@@ -53,7 +53,7 @@ class BackupTests(unittest.TestCase):
         self.config.write_text(json.dumps({"reserve": [{
             "username": "test", "password": "test", "roomid": "101", "seatid": ["001"],
             "time": ["11:00", "19:00"], "daysofweek": [],
-            "backups": [{"roomid": "202", "seatid": ["002"], "time": ["12:00", "16:00"]}],
+            "backups": [{"roomid": "202", "seatid": ["002"], "time": ["11:00", "19:00"]}],
         }]}), encoding="utf-8")
 
     def run_cli(self, *extra):
@@ -64,18 +64,44 @@ class BackupTests(unittest.TestCase):
         return code, [json.loads(line) for line in output.getvalue().splitlines()]
 
     def test_backup_runs_after_primary_fully_fails(self):
-        FakeReserve.outcomes = {("202", "12:00"): True}
+        FakeReserve.outcomes = {("202", "11:00"): True, ("202", "15:00"): True}
         code, lines = self.run_cli("--ignore-weekday")
         self.assertEqual(code, 0)
-        self.assertEqual([entry[0] for entry in FakeReserve.attempts], ["101", "101", "202"])
-        self.assertEqual([line["plan"] for line in lines], [1, 1, 2])
+        self.assertEqual([entry[0] for entry in FakeReserve.attempts], ["101", "101", "202", "202"])
+        self.assertEqual([line["plan"] for line in lines if "plan" in line], [1, 1, 2, 2])
+        self.assertEqual(lines[-1]["status"], "complete")
 
-    def test_partial_primary_stops_before_backup(self):
-        FakeReserve.outcomes = {("101", "11:00"): True, ("202", "12:00"): True}
+    def test_partial_primary_is_filled_without_rebooking_successful_slot(self):
+        FakeReserve.outcomes = {("101", "11:00"): True, ("202", "15:00"): True}
+        code, lines = self.run_cli("--ignore-weekday")
+        self.assertEqual(code, 0)
+        self.assertEqual(FakeReserve.attempts, [("101", "001", "11:00"),
+                                                 ("101", "001", "15:00"),
+                                                 ("202", "002", "15:00")])
+        self.assertEqual(lines[-1]["status"], "complete")
+
+    def test_backup_time_is_limited_to_primary_target(self):
+        user = json.loads(self.config.read_text(encoding="utf-8"))
+        user["reserve"][0]["backups"][0]["time"] = ["10:00", "16:00"]
+        self.config.write_text(json.dumps(user), encoding="utf-8")
+        FakeReserve.outcomes = {("202", "11:00"): True, ("202", "15:00"): True}
         code, lines = self.run_cli("--ignore-weekday")
         self.assertEqual(code, 1)
-        self.assertEqual([entry[0] for entry in FakeReserve.attempts], ["101", "101"])
-        self.assertEqual(lines[-1]["status"], "partial_success")
+        self.assertEqual([entry[2] for entry in FakeReserve.attempts if entry[0] == "202"],
+                         ["11:00", "15:00"])
+        self.assertEqual(lines[-1]["missing"], [["16:00", "19:00"]])
+
+    def test_later_backup_only_fills_earlier_backup_gap(self):
+        user = json.loads(self.config.read_text(encoding="utf-8"))
+        user["reserve"][0]["backups"].append(
+            {"roomid": "303", "seatid": ["003"], "time": ["11:00", "19:00"]})
+        self.config.write_text(json.dumps(user), encoding="utf-8")
+        FakeReserve.outcomes = {("202", "11:00"): True, ("303", "15:00"): True}
+        code, lines = self.run_cli("--ignore-weekday")
+        self.assertEqual(code, 0)
+        self.assertEqual(FakeReserve.attempts[-1], ("303", "003", "15:00"))
+        self.assertEqual([entry[2] for entry in FakeReserve.attempts if entry[0] == "303"], ["15:00"])
+        self.assertEqual(lines[-1]["status"], "complete")
 
     def test_check_only_lists_plans_without_booking(self):
         code, lines = self.run_cli("--check-only")
