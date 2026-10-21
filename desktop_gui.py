@@ -83,8 +83,9 @@ class SeatApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("超星图书馆座位预约")
-        self.geometry("1040x820")
-        self.minsize(860, 820)
+        self.minsize(860, 500)
+        self.geometry(f"{min(1040, self.winfo_screenwidth() - 60)}x"
+                      f"{min(820, self.winfo_screenheight() - 100)}")
         self.configure(bg=COLORS["canvas"])
         self.events = queue.Queue()
         self.busy = False
@@ -138,8 +139,20 @@ class SeatApp(tk.Tk):
         tk.Label(header, text="选择阅览区与时段，查询空座；也可以设定自动预约。", bg=COLORS["ink"],
                  fg="#C4D5CE", font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(3, 0))
 
-        outer = ttk.Frame(self, padding=(24, 17, 24, 13))
-        outer.pack(fill="both", expand=True)
+        viewport = ttk.Frame(self)
+        viewport.pack(fill="both", expand=True)
+        self.content_canvas = tk.Canvas(viewport, bg=COLORS["canvas"], highlightthickness=0)
+        self.content_canvas.pack(side="left", fill="both", expand=True)
+        content_scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=self.content_canvas.yview)
+        content_scrollbar.pack(side="right", fill="y")
+        self.content_canvas.configure(yscrollcommand=content_scrollbar.set)
+        outer = ttk.Frame(self.content_canvas, padding=(24, 17, 24, 13))
+        content_window = self.content_canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>", lambda _event: self.content_canvas.configure(
+            scrollregion=self.content_canvas.bbox("all")))
+        self.content_canvas.bind("<Configure>", lambda event: self.content_canvas.itemconfigure(
+            content_window, width=event.width))
+        self.bind_all("<MouseWheel>", self._scroll_content, add="+")
         ttk.Label(outer, text="01  账号与学校", style="Eyebrow.TLabel").pack(anchor="w", pady=(0, 8))
         account = ttk.Frame(outer, style="Surface.TFrame", padding=15)
         account.pack(fill="x", pady=(0, 15))
@@ -180,23 +193,25 @@ class SeatApp(tk.Tk):
         ttk.Label(search, text="阅览区", style="Field.TLabel").grid(row=3, column=0, sticky="w")
         room_box = ttk.Frame(search, style="Surface.TFrame")
         room_box.grid(row=4, column=0, sticky="ew", padx=(0, 14), pady=(5, 12))
-        self.room_combo = ttk.Combobox(room_box, textvariable=self.room, values=list(ROOMS), width=33)
+        self.room_combo = ttk.Combobox(room_box, textvariable=self.room, values=list(ROOMS), width=26)
         self.room_combo.pack(side="left", fill="x", expand=True)
         self.refresh_rooms_button = ttk.Button(room_box, text="刷新区域", command=self._load_rooms)
         self.refresh_rooms_button.pack(side="left", padx=(8, 0))
         ttk.Label(search, text="预约日期", style="Field.TLabel").grid(row=3, column=1, sticky="w")
         day_picker, self.day_year, self.day_month, self.day_number = self._date_picker(search, self.day)
         day_picker.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(5, 12))
-        ttk.Button(search, text="今天", command=lambda: self._set_day(0)).grid(row=4, column=2, padx=(0, 5), pady=(5, 12))
-        ttk.Button(search, text="明天", command=lambda: self._set_day(1)).grid(row=4, column=3, pady=(5, 12))
-        ttk.Label(search, text="开始时间", style="Field.TLabel").grid(row=5, column=0, sticky="w")
+        date_actions = ttk.Frame(search, style="Surface.TFrame")
+        date_actions.grid(row=5, column=1, columnspan=3, sticky="w", pady=(0, 12))
+        ttk.Button(date_actions, text="今天", command=lambda: self._set_day(0)).pack(side="left", padx=(0, 5))
+        ttk.Button(date_actions, text="明天", command=lambda: self._set_day(1)).pack(side="left")
+        ttk.Label(search, text="开始时间", style="Field.TLabel").grid(row=6, column=0, sticky="w")
         start_picker, self.start_hour, self.start_minute = self._time_picker(search, self.start)
-        start_picker.grid(row=6, column=0, sticky="w", pady=(5, 0))
-        ttk.Label(search, text="结束时间", style="Field.TLabel").grid(row=5, column=1, sticky="w")
+        start_picker.grid(row=7, column=0, sticky="w", pady=(5, 0))
+        ttk.Label(search, text="结束时间", style="Field.TLabel").grid(row=6, column=1, sticky="w")
         end_picker, self.end_hour, self.end_minute = self._time_picker(search, self.end)
-        end_picker.grid(row=6, column=1, sticky="w", pady=(5, 0))
+        end_picker.grid(row=7, column=1, sticky="w", pady=(5, 0))
         self.query_button = ttk.Button(search, text="查询可预约座位", style="Accent.TButton", command=self._query)
-        self.query_button.grid(row=6, column=2, columnspan=2, sticky="e")
+        self.query_button.grid(row=7, column=2, columnspan=2, sticky="e")
         search.columnconfigure(0, weight=2)
         search.columnconfigure(1, weight=1)
 
@@ -276,6 +291,13 @@ class SeatApp(tk.Tk):
         status_bar.pack(fill="x", pady=(12, 0))
         ttk.Label(status_bar, text="●  程序状态", style="Soft.TLabel").pack(side="left", padx=(0, 13))
         ttk.Label(status_bar, textvariable=self.status, style="Soft.TLabel").pack(side="left")
+
+    def _scroll_content(self, event):
+        if event.widget.winfo_toplevel() is not self:
+            return
+        if isinstance(event.widget, (ttk.Treeview, ttk.Combobox)):
+            return
+        self.content_canvas.yview_scroll(-int(event.delta / 120), "units")
 
     @staticmethod
     def _time_picker(parent, value):
