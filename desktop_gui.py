@@ -231,6 +231,8 @@ class SeatApp(tk.Tk):
         self.schedule_seat = tk.StringVar(value="150")
         self.schedule_start = tk.StringVar(value="11:00")
         self.schedule_end = tk.StringVar(value="21:00")
+        self.backup_plans = []
+        self.backup_summary = tk.StringVar(value="备选方案（0）")
         self.schedule_days = {name: tk.BooleanVar() for name, _ in WEEKDAYS}
         ttk.Label(form, text="执行时间（本机时间）", style="Field.TLabel").grid(row=0, column=0, sticky="w")
         at_picker, self.schedule_at_hour, self.schedule_at_minute = self._time_picker(form, self.schedule_at)
@@ -260,12 +262,13 @@ class SeatApp(tk.Tk):
         self.schedule_save_button = ttk.Button(controls, text="保存定时预约", style="Accent.TButton",
                                                command=self._save_schedule)
         self.schedule_save_button.pack(side="left")
+        ttk.Button(controls, textvariable=self.backup_summary, command=self._edit_backups).pack(side="left", padx=(10, 0))
         ttk.Button(controls, text="刷新任务状态", command=self._refresh_schedule).pack(side="left", padx=(12, 0))
         ttk.Button(controls, text="查看运行日志", command=self._show_run_log).pack(side="left", padx=(12, 0))
         self.schedule_status = tk.StringVar(value="点击“刷新任务状态”查看下一次运行时间。")
         ttk.Label(schedule_tab, text="任务状态", style="Section.TLabel").pack(anchor="w", pady=(10, 5))
         ttk.Label(schedule_tab, textvariable=self.schedule_status, justify="left", style="Surface.TLabel").pack(anchor="w")
-        ttk.Label(schedule_tab, text="单次最多 4 小时；程序会自动分段。运行结果保存在 last-run.log。",
+        ttk.Label(schedule_tab, text="主方案全部失败才尝试备选；部分成功则停止。单次最多 4 小时，运行结果保存在 last-run.log。",
                   style="SurfaceHint.TLabel").pack(anchor="w", pady=(12, 0))
 
         self.status = tk.StringVar(value="就绪")
@@ -399,6 +402,8 @@ class SeatApp(tk.Tk):
             if len(period) == 2:
                 self.schedule_start.set(period[0])
                 self.schedule_end.set(period[1])
+            self.backup_plans = list(account.get("backups") or [])
+            self.backup_summary.set(f"备选方案（{len(self.backup_plans)}）")
             for name, _ in WEEKDAYS:
                 self.schedule_days[name].set(name in account.get("daysofweek", []))
         except (OSError, ValueError, KeyError, IndexError) as error:
@@ -588,6 +593,141 @@ class SeatApp(tk.Tk):
             content = f"读取日志失败：{error}"
         messagebox.showinfo("定时任务运行日志", content, parent=self)
 
+    def _edit_backups(self):
+        try:
+            dept_id_enc = parse_dept_id(self.dept_id.get())
+        except ValueError:
+            dept_id_enc = None
+        if not dept_id_enc or self.loaded_dept != dept_id_enc or not self.room_names:
+            messagebox.showwarning("请先刷新区域", "请先填写学校选座链接并刷新当前学校的阅览区。", parent=self)
+            return
+
+        plans = [dict(plan) for plan in self.backup_plans]
+        dialog = tk.Toplevel(self)
+        dialog.title("管理定时预约备选方案")
+        dialog.geometry("760x520")
+        dialog.minsize(700, 470)
+        dialog.configure(bg=COLORS["canvas"])
+        dialog.transient(self)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="备选方案", style="Eyebrow.TLabel").pack(anchor="w")
+        ttk.Label(body, text="主方案全部失败后，按列表顺序尝试；有任何时段成功就停止。",
+                  style="Hint.TLabel").pack(anchor="w", pady=(4, 12))
+
+        table = ttk.Treeview(body, columns=("order", "room", "seat", "time"), show="headings", height=6, selectmode="browse")
+        for key, title, width in (("order", "顺序", 60), ("room", "阅览区", 300),
+                                  ("seat", "座位", 80), ("time", "时段", 150)):
+            table.heading(key, text=title)
+            table.column(key, width=width, anchor="w" if key == "room" else "center")
+        table.pack(fill="both", expand=True)
+
+        editor = ttk.Frame(body, style="Surface.TFrame", padding=12)
+        editor.pack(fill="x", pady=(12, 0))
+        room_var = tk.StringVar(value=self.schedule_room.get())
+        seat_var = tk.StringVar()
+        start_var = tk.StringVar(value=self.schedule_start.get())
+        end_var = tk.StringVar(value=self.schedule_end.get())
+        ttk.Label(editor, text="阅览区", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(editor, text="座位号", style="Field.TLabel").grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(editor, text="开始", style="Field.TLabel").grid(row=0, column=2, sticky="w", padx=(10, 0))
+        ttk.Label(editor, text="结束", style="Field.TLabel").grid(row=0, column=3, sticky="w", padx=(10, 0))
+        ttk.Combobox(editor, textvariable=room_var, values=list(self.room_names), state="readonly").grid(
+            row=1, column=0, sticky="ew", pady=(5, 0))
+        ttk.Entry(editor, textvariable=seat_var, width=9).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(5, 0))
+        start_picker, _, _ = self._time_picker(editor, start_var)
+        start_picker.grid(row=1, column=2, padx=(10, 0), pady=(5, 0))
+        end_picker, _, _ = self._time_picker(editor, end_var)
+        end_picker.grid(row=1, column=3, padx=(10, 0), pady=(5, 0))
+        editor.columnconfigure(0, weight=1)
+
+        def room_label(roomid):
+            return next((name for name, value in self.room_names.items() if value == roomid), roomid)
+
+        def refresh(selected=None):
+            table.delete(*table.get_children())
+            for index, plan in enumerate(plans):
+                table.insert("", "end", iid=str(index), values=(index + 1, room_label(plan["roomid"]),
+                            plan["seatid"][0], "–".join(plan["time"])))
+            if selected is not None and 0 <= selected < len(plans):
+                table.selection_set(str(selected))
+
+        def selected_index():
+            selection = table.selection()
+            return int(selection[0]) if selection else None
+
+        def select_plan(_event=None):
+            index = selected_index()
+            if index is None:
+                return
+            plan = plans[index]
+            room_var.set(room_label(plan["roomid"]))
+            seat_var.set(str(plan["seatid"][0]))
+            start_var.set(plan["time"][0])
+            end_var.set(plan["time"][1])
+
+        def form_plan():
+            roomid = parse_room(room_var.get())
+            if roomid not in self.room_names.values():
+                raise ValueError("请选择当前学校的阅览区。")
+            seat = seat_var.get().strip()
+            if not seat.isdecimal() or int(seat) < 1:
+                raise ValueError("备选座位号必须是正整数。")
+            start = dt.datetime.strptime(start_var.get(), "%H:%M").strftime("%H:%M")
+            end = dt.datetime.strptime(end_var.get(), "%H:%M").strftime("%H:%M")
+            build_segments(start, end)
+            return {"roomid": roomid, "seatid": [seat.zfill(3)], "time": [start, end]}
+
+        def change(replace=False):
+            try:
+                plan = form_plan()
+            except ValueError as error:
+                messagebox.showerror("备选方案有误", str(error), parent=dialog)
+                return
+            index = selected_index() if replace else None
+            if replace and index is None:
+                messagebox.showinfo("请选择方案", "先选中要修改的备选方案。", parent=dialog)
+                return
+            if replace:
+                plans[index] = plan
+            else:
+                plans.append(plan)
+                index = len(plans) - 1
+            refresh(index)
+
+        def remove():
+            index = selected_index()
+            if index is not None:
+                plans.pop(index)
+                refresh(min(index, len(plans) - 1))
+
+        def move(offset):
+            index = selected_index()
+            if index is None or not 0 <= index + offset < len(plans):
+                return
+            plans[index], plans[index + offset] = plans[index + offset], plans[index]
+            refresh(index + offset)
+
+        table.bind("<<TreeviewSelect>>", select_plan)
+        refresh()
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(actions, text="添加", command=change).pack(side="left")
+        ttk.Button(actions, text="更新选中", command=lambda: change(True)).pack(side="left", padx=(7, 0))
+        ttk.Button(actions, text="删除", command=remove).pack(side="left", padx=(7, 0))
+        ttk.Button(actions, text="上移", command=lambda: move(-1)).pack(side="left", padx=(7, 0))
+        ttk.Button(actions, text="下移", command=lambda: move(1)).pack(side="left", padx=(7, 0))
+
+        def save():
+            self.backup_plans = plans
+            self.backup_summary.set(f"备选方案（{len(plans)}）")
+            dialog.destroy()
+
+        ttk.Button(actions, text="完成编辑", style="Accent.TButton", command=save).pack(side="right")
+        ttk.Label(body, text="完成编辑后，请回到主窗口点击“保存定时预约”才会写入配置。",
+                  style="Hint.TLabel").pack(anchor="w", pady=(9, 0))
+
     def _save_schedule(self):
         if self.busy:
             return
@@ -617,6 +757,17 @@ class SeatApp(tk.Tk):
             item = updated["reserve"][0]
             item.update(username=username, password=password, roomid=roomid,
                         seatid=[seat.zfill(3)], time=[start, end], daysofweek=days)
+            backups = []
+            for index, plan in enumerate(self.backup_plans, start=1):
+                backup_room = str(plan["roomid"])
+                backup_seat = str(plan["seatid"][0])
+                backup_start, backup_end = plan["time"]
+                if backup_room not in self.room_names.values() or not backup_seat.isdecimal() or int(backup_seat) < 1:
+                    raise ValueError(f"备选方案 {index} 的区域或座位无效，请重新编辑。")
+                build_segments(backup_start, backup_end)
+                backups.append({"roomid": backup_room, "seatid": [backup_seat.zfill(3)],
+                                "time": [backup_start, backup_end]})
+            item["backups"] = backups
             updated["deptIdEnc"] = dept_id_enc
             updated["scheduleAt"] = at
         except (ValueError, KeyError, IndexError, OSError) as error:

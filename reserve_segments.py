@@ -21,6 +21,29 @@ def build_segments(start_text, end_text):
     return segments
 
 
+def reservation_plans(user, overrides=None):
+    """Return the primary plan followed by ordered alternatives."""
+    overrides = overrides or {}
+    raw_plans = [user] if overrides else [user, *user.get("backups", [])]
+    plans = []
+    for index, item in enumerate(raw_plans):
+        roomid = str(overrides.get("roomid") or item["roomid"]).strip()
+        seatids = ([str(overrides["seatid"])] if overrides.get("seatid")
+                   else [str(value).strip() for value in item["seatid"]])
+        times = item["time"]
+        start = overrides.get("start") or times[0]
+        end = overrides.get("end") or times[1]
+        if not roomid.isdecimal() or not seatids or any(not seat.isdecimal() or int(seat) < 1 for seat in seatids):
+            raise ValueError(f"Invalid room or seat in plan {index + 1}")
+        plans.append({
+            "plan": index + 1,
+            "roomid": roomid,
+            "seatid": seatids,
+            "segments": build_segments(start, end),
+        })
+    return plans
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-u", "--user", required=True)
@@ -37,11 +60,11 @@ def main():
     if len(users) != 1:
         raise ValueError("Exactly one account is supported")
     user = users[0]
-    roomid = args.roomid or user["roomid"]
-    seatid = [args.seatid] if args.seatid else user["seatid"]
-    segments = build_segments(args.start or user["time"][0], args.end or user["time"][1])
+    overrides = {key: value for key in ("roomid", "seatid", "start", "end")
+                 if (value := getattr(args, key)) is not None}
+    plans = reservation_plans(user, overrides)
     if args.check_only:
-        print(json.dumps({"roomid": roomid, "seatid": seatid, "segments": segments}, ensure_ascii=True))
+        print(json.dumps({"plans": plans}, ensure_ascii=True))
         return 0
 
     today = dt.date.today()
@@ -74,33 +97,43 @@ def main():
         return response
 
     client.requests.post = capture_submit
-    all_successful = True
-    for start, end in segments:
-        client.max_attempt = 2
-        submit_response = None
-        try:
-            success = client.submit([start, end], roomid, seatid, False)
-            response = submit_response.json() if submit_response is not None else {}
-            record = (response.get("data") or {}).get("seatReserve") or {}
-            result = {
-                "date": str(today + dt.timedelta(days=1)),
-                "time": [start, end],
-                "roomid": roomid,
-                "seatid": seatid,
-                "success": bool(success),
-                "message": response.get("msg", ""),
-                "reservation_id": record.get("id"),
-            }
-        except Exception as error:
-            result = {
-                "date": str(today + dt.timedelta(days=1)),
-                "time": [start, end],
-                "success": False,
-                "error": type(error).__name__,
-            }
-        print(json.dumps(result, ensure_ascii=True), flush=True)
-        all_successful &= result["success"]
-    return 0 if all_successful else 1
+    for plan in plans:
+        succeeded = 0
+        for start, end in plan["segments"]:
+            client.max_attempt = 2
+            submit_response = None
+            try:
+                success = client.submit([start, end], plan["roomid"], plan["seatid"], False)
+                response = submit_response.json() if submit_response is not None else {}
+                record = (response.get("data") or {}).get("seatReserve") or {}
+                result = {
+                    "date": str(today + dt.timedelta(days=1)),
+                    "plan": plan["plan"],
+                    "time": [start, end],
+                    "roomid": plan["roomid"],
+                    "seatid": plan["seatid"],
+                    "success": bool(success),
+                    "message": response.get("msg", ""),
+                    "reservation_id": record.get("id"),
+                }
+            except Exception as error:
+                result = {
+                    "date": str(today + dt.timedelta(days=1)),
+                    "plan": plan["plan"],
+                    "time": [start, end],
+                    "roomid": plan["roomid"],
+                    "seatid": plan["seatid"],
+                    "success": False,
+                    "error": type(error).__name__,
+                }
+            print(json.dumps(result, ensure_ascii=True), flush=True)
+            succeeded += result["success"]
+        if succeeded:
+            if succeeded < len(plan["segments"]):
+                print(json.dumps({"plan": plan["plan"], "status": "partial_success", "backups_skipped": True}), flush=True)
+                return 1
+            return 0
+    return 1
 
 
 if __name__ == "__main__":
