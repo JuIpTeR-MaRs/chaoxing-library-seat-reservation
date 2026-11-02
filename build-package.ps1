@@ -15,10 +15,11 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $package = Join-Path $project "dist\SeatDesk-$stamp"
 New-Item -ItemType Directory -Path $package -Force | Out-Null
 
-& $python -m PyInstaller --noconfirm --clean --onefile --windowed --name SeatDesk --distpath $package --workpath (Join-Path $project 'build\seatdesk-gui') --specpath (Join-Path $project 'build') (Join-Path $project 'desktop_gui.py')
+$holidayData = (Join-Path $project 'holidays.json') + ';.'
+& $python -m PyInstaller --noconfirm --clean --onefile --windowed --name SeatDesk --add-data $holidayData --distpath $package --workpath (Join-Path $project 'build\seatdesk-gui') --specpath (Join-Path $project 'build') (Join-Path $project 'desktop_gui.py')
 if ($LASTEXITCODE -ne 0) { throw 'GUI packaging failed.' }
 
-Copy-Item -LiteralPath (Join-Path $project 'schedule_task.ps1'), (Join-Path $project 'run-local.ps1'), (Join-Path $project 'package-launch.cmd'), (Join-Path $project 'PACKAGE_README.md') -Destination $package
+Copy-Item -LiteralPath (Join-Path $project 'schedule_task.ps1'), (Join-Path $project 'run-local.ps1'), (Join-Path $project 'package-launch.cmd'), (Join-Path $project 'PACKAGE_README.md'), (Join-Path $project 'holidays.json') -Destination $package
 Copy-Item -LiteralPath (Join-Path $project 'package-template.json') -Destination (Join-Path $package 'config.local.json')
 $zip = "$package.zip"
 Compress-Archive -LiteralPath $package -DestinationPath $zip

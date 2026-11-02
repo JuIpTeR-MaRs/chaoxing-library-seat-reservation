@@ -238,6 +238,15 @@ class reserve:
                 token, value = self._get_page_token(
                     self.url.format(roomid, seat), require_value=True
                 )
+                if not token or not value:
+                    offset = int(self.reserve_next_day) + int(bool(action))
+                    day = get_date(offset)
+                    token, value = self._get_page_token(
+                        f"https://office.chaoxing.com/front/apps/seat/select?id={roomid}&day={day}&backLevel=2",
+                        require_value=True,
+                    )
+                if not token or not value:
+                    raise RuntimeError("Seat page did not provide a submission token")
                 logging.info(f"Get token: {token}")
                 captcha = self.resolve_captcha() if self.enable_slider else ""
                 logging.info(f"Captcha token {captcha}")

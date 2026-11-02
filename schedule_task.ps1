@@ -2,10 +2,12 @@ param(
     [ValidateSet('Inspect', 'Set')][string]$Action = 'Inspect',
     [string]$At,
     [string]$Days,
-    [string]$TaskName = 'ChaoXingReserveSeat'
+    [ValidateRange(1, 2147483647)][int]$Account = 1,
+    [string]$TaskName
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $TaskName) { $TaskName = if ($Account -eq 1) { 'ChaoXingReserveSeat' } else { "ChaoXingReserveSeat-$Account" } }
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 if ($Action -eq 'Inspect' -and -not $task) {
@@ -29,14 +31,14 @@ if ($Action -eq 'Set') {
     }
     $runTime = [datetime]::ParseExact($At, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
     $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $selectedDays -At $runTime
+    $project = $PSScriptRoot
+    $script = Join-Path $project 'run-local.ps1'
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script + '" -Account ' + $Account
+    $taskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments -WorkingDirectory $project
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -WakeToRun -MultipleInstances IgnoreNew
     if ($task) {
-        Set-ScheduledTask -TaskName $TaskName -Trigger $trigger | Out-Null
+        Set-ScheduledTask -TaskName $TaskName -Trigger $trigger -Action $taskAction -Settings $settings | Out-Null
     } else {
-        $project = $PSScriptRoot
-        $script = Join-Path $project 'run-local.ps1'
-        $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $script + '"'
-        $taskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments -WorkingDirectory $project
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -WakeToRun -MultipleInstances IgnoreNew
         $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
         Register-ScheduledTask -TaskName $TaskName -Action $taskAction -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
     }

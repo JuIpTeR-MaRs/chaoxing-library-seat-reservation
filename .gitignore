@@ -104,8 +104,15 @@ celerybeat.pid
 # Environments
 .env
 config.local.json
+scheduled-account.lock
+scheduled-account-state.json
 last-run.log
 .venv
+.venv-new/
+.venv-repaired/
+.venv-backup-*/
+python-*-amd64.exe
+python-*-amd64.zip
 env/
 venv/
 ENV/
@@ -130,3 +137,4 @@ dmypy.json
 # Pyre type checker
 .pyre/
 test.json
+tests/manual_*.py
