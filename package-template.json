@@ -1,6 +1,8 @@
 {
   "deptIdEnc": "",
   "scheduleAt": "22:00",
+  "skipHolidays": true,
+  "adjustments": {},
   "reserve": [
     {
       "username": "",
