@@ -41,6 +41,13 @@ WEEKDAYS = [
 ]
 
 
+def manual_default_datetime(now=None):
+    now = now or dt.datetime.now(LOCAL_TZ)
+    day = now.date() + dt.timedelta(days=now.time() > dt.time(22, 0))
+    start = now.replace(minute=30 if now.minute >= 30 else 0, second=0, microsecond=0)
+    return day.isoformat(), start.strftime("%H:%M")
+
+
 def load_config():
     with CONFIG_PATH.open(encoding="utf-8") as file:
         return json.load(file)
@@ -348,8 +355,9 @@ class SeatApp(tk.Tk):
         ttk.Label(search, text="学校选座链接或 deptIdEnc", style="Field.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(13, 0))
         self.dept_id = tk.StringVar()
         self.room = tk.StringVar(value=list(ROOMS)[1])
-        self.day = tk.StringVar(value=dt.datetime.now(LOCAL_TZ).date().isoformat())
-        self.start = tk.StringVar(value="18:30")
+        default_day, default_start = manual_default_datetime()
+        self.day = tk.StringVar(value=default_day)
+        self.start = tk.StringVar(value=default_start)
         self.end = tk.StringVar(value="21:00")
         ttk.Entry(search, textvariable=self.dept_id).grid(row=2, column=0, columnspan=4, sticky="ew", pady=(5, 12))
         ttk.Label(search, text="阅览区", style="Field.TLabel").grid(row=3, column=0, sticky="w")
@@ -635,21 +643,17 @@ class SeatApp(tk.Tk):
                 self._loading_account = False
             manual = account.get("manual") or {}
             self.room.set(str(manual.get("room", "")))
-            self.day.set(dt.datetime.now(LOCAL_TZ).date().isoformat())
+            default_day, default_start = manual_default_datetime()
+            self.day.set(default_day)
+            self.start.set(default_start)
+            self.end.set("21:00")
             try:
-                saved_day = dt.date.fromisoformat(manual.get("day", ""))
-                if saved_day >= dt.datetime.now(LOCAL_TZ).date():
-                    self.day.set(saved_day.isoformat())
+                value = dt.datetime.strptime(manual.get("end", ""), "%H:%M").strftime("%H:%M")
+                self.end.set(value)
             except ValueError:
                 pass
-            self.start.set("18:30")
-            self.end.set("21:00")
-            for field, variable in (("start", self.start), ("end", self.end)):
-                try:
-                    value = dt.datetime.strptime(manual.get(field, ""), "%H:%M").strftime("%H:%M")
-                    variable.set(value)
-                except ValueError:
-                    pass
+            if self.end.get() <= default_start:
+                self.end.set("23:59")
             self.schedule_at.set(account.get("scheduleAt", data.get("scheduleAt", "22:00")))
             self.auto_cancel_other.set(data.get("autoCancelOtherOnSuccess") is True)
             self.schedule_room.set(str(account.get("roomid", "")))
