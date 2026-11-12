@@ -36,6 +36,8 @@ class reserve:
         self.success_times = 0
         self.fail_dict = []
         self.submit_msg = []
+        self.submit_attempts = []      # per-attempt msg/error, for accurate reporting
+        self.last_submit_payload = {}  # parsed body of the last submit response
         self.requests = requests.session()
         self.token_pattern = re.compile("token = '(.*?)'")
         self.headers = {
@@ -231,35 +233,57 @@ class reserve:
         tl = max_loc
         return tl[0]
 
-    def submit(self, times, roomid, seatid, action):
+    def submit(self, times, roomid, seatid, action, prepared=None):
         for seat in seatid:
             suc = False
-            while ~suc and self.max_attempt > 0:
-                token, value = self._get_page_token(
-                    self.url.format(roomid, seat), require_value=True
-                )
-                if not token or not value:
-                    offset = int(self.reserve_next_day) + int(bool(action))
-                    day = get_date(offset)
+            used_prepared = False
+            while not suc and self.max_attempt > 0:
+                if (not used_prepared and prepared is not None
+                        and str(seat) == str(prepared.get("seat"))
+                        and times[0] == prepared.get("start")
+                        and times[1] == prepared.get("end")):
+                    token = prepared.get("token")
+                    value = prepared.get("value")
+                    captcha = prepared.get("captcha") or ""
+                    used_prepared = True
+                    prepared["used"] = True
+                else:
                     token, value = self._get_page_token(
-                        f"https://office.chaoxing.com/front/apps/seat/select?id={roomid}&day={day}&backLevel=2",
-                        require_value=True,
+                        self.url.format(roomid, seat), require_value=True
                     )
-                if not token or not value:
-                    raise RuntimeError("Seat page did not provide a submission token")
+                    if not token or not value:
+                        offset = int(self.reserve_next_day) + int(bool(action))
+                        day = get_date(offset)
+                        token, value = self._get_page_token(
+                            f"https://office.chaoxing.com/front/apps/seat/select?id={roomid}&day={day}&backLevel=2",
+                            require_value=True,
+                        )
+                    if not token or not value:
+                        raise RuntimeError("Seat page did not provide a submission token")
+                    captcha = self.resolve_captcha() if self.enable_slider else ""
                 logging.info(f"Get token: {token}")
-                captcha = self.resolve_captcha() if self.enable_slider else ""
                 logging.info(f"Captcha token {captcha}")
-                suc = self.get_submit(
-                    self.submit_url,
-                    times=times,
-                    token=token,
-                    roomid=roomid,
-                    seatid=seat,
-                    captcha=captcha,
-                    action=action,
-                    value=value,
-                )
+                attempt = {"times": [str(times[0]), str(times[1])], "seat": str(seat),
+                           "source": "prepared" if used_prepared else "page"}
+                self.last_submit_payload = {}
+                try:
+                    suc = self.get_submit(
+                        self.submit_url,
+                        times=times,
+                        token=token,
+                        roomid=roomid,
+                        seatid=seat,
+                        captcha=captcha,
+                        action=action,
+                        value=value,
+                    )
+                except Exception as error:
+                    attempt["error"] = type(error).__name__
+                    self.submit_attempts.append(attempt)
+                    raise
+                attempt["success"] = bool(suc)
+                attempt["message"] = (self.last_submit_payload or {}).get("msg", "")
+                self.submit_attempts.append(attempt)
                 if suc:
                     return suc
                 time.sleep(self.sleep_time)
@@ -267,7 +291,8 @@ class reserve:
         return suc
 
     def get_submit(
-        self, url, times, token, roomid, seatid, captcha="", action=False, value=""
+        self, url, times, token, roomid, seatid, captcha="", action=False, value="",
+        timeout=None,
     ):
         delta_day = 1 if self.reserve_next_day else 0
         day = datetime.date.today() + datetime.timedelta(
@@ -291,11 +316,13 @@ class reserve:
         logging.info(f"submit parameter {parm} ")
         # parm["enc"] = enc(parm)
         parm["enc"] = verify_param(parm, value)
-        html = self.requests.post(url=url, params=parm, verify=True).content.decode(
-            "utf-8"
-        )
+        request_kwargs = {"url": url, "params": parm, "verify": True}
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        html = self.requests.post(**request_kwargs).content.decode("utf-8")
+        self.last_submit_payload = json.loads(html)
         self.submit_msg.append(
-            times[0] + "~" + times[1] + ":  " + str(json.loads(html))
+            times[0] + "~" + times[1] + ":  " + str(self.last_submit_payload)
         )
-        logging.info(json.loads(html))
-        return json.loads(html)["success"]
+        logging.info(self.last_submit_payload)
+        return self.last_submit_payload["success"]

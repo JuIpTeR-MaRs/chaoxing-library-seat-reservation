@@ -1,7 +1,7 @@
 """Chinese statutory holidays and adjusted days for the scheduled runner.
 
 Dates come from ``holidays.json`` beside the program (or beside the packaged
-``SeatDesk.exe``), so the list can be updated without touching code. Two tables
+``SeatDesk.exe``), so the list can be updated without touching code. Three tables
 are read from that file:
 
 ``holidays``
@@ -10,6 +10,10 @@ are read from that file:
     Days moved by the holiday arrangement: ``workday`` (a weekend that becomes
     a working day) or ``restday`` (a working day given as time off). They never
     skip automatically; they are listed for the user to decide per date.
+``pending``
+    Break ranges whose legal holidays are not known yet (a freshly published
+    arrangement before timor.tech catches up). They never skip automatically;
+    the run logs a warning when the target date falls inside one.
 
 A missing, unreadable or malformed file never blocks a reservation: the
 calendar degrades to "nothing known" and the caller logs a warning.
@@ -57,11 +61,12 @@ def as_date(value):
 
 
 class HolidayCalendar:
-    """Holidays and adjusted days loaded from ``holidays.json``."""
+    """Holidays, adjusted days and pending break ranges from ``holidays.json``."""
 
-    def __init__(self, days=None, adjustments=None, path=None, error=None):
+    def __init__(self, days=None, adjustments=None, path=None, error=None, pending=None):
         self.days = dict(days or {})
         self.adjustments = dict(adjustments or {})
+        self.pending = list(pending or [])
         self.path = Path(path) if path else default_path()
         self.error = error
         self.years = {day.year for day in self.days}
@@ -76,6 +81,14 @@ class HolidayCalendar:
     def adjustment(self, value):
         """Return ``{"kind": ..., "name": ...}`` for an adjusted day, or ``None``."""
         return self.adjustments.get(as_date(value))
+
+    def pending_for(self, value):
+        """Name of the break whose legal days are still unknown, or ``None``."""
+        day = as_date(value)
+        for start, end, name in self.pending:
+            if start <= day <= end:
+                return name
+        return None
 
     def covers(self, value):
         """Whether the data file has any entry in that date's year."""
@@ -115,6 +128,11 @@ def _parse_adjustment(entry):
     return kind, name, _parse_dates(entry, "adjustment")
 
 
+def entry_dates(entry, label="entry"):
+    """Dates covered by one ``holidays.json`` entry (``start``/``end`` or ``dates``)."""
+    return _parse_dates(entry, label)
+
+
 def load_calendar(path=None):
     """Load one calendar from disk, reporting problems instead of raising."""
     target = Path(path) if path else default_path()
@@ -130,12 +148,21 @@ def load_calendar(path=None):
             kind, name, dates = _parse_adjustment(entry)
             for day in dates:
                 adjustments[day] = {"kind": kind, "name": name}
+        pending = []
+        for entry in data.get("pending") or []:
+            # `pending` is advisory: one malformed range must not disable skipping.
+            try:
+                name = str(entry.get("name") or "放假区间").strip()
+                dates = _parse_dates(entry, "pending")
+            except (ValueError, TypeError, AttributeError):
+                continue
+            pending.append((dates[0], dates[-1], name))
     except FileNotFoundError:
         return HolidayCalendar(path=target,
                                error=f"{target.name} not found; holiday skipping is off")
     except (OSError, ValueError, TypeError, KeyError) as error:
         return HolidayCalendar(path=target, error=f"{target.name}: {error}")
-    return HolidayCalendar(days, adjustments, target)
+    return HolidayCalendar(days, adjustments, target, pending=pending)
 
 
 def calendar(path=None):

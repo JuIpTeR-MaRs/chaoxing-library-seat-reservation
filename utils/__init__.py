@@ -1,4 +1,5 @@
 import os 
+from . import net  # 导入即生效：让超星站点绕过系统代理，必须早于任何 requests.Session
 from .encrypt import AES_Encrypt, generate_captcha_key, enc, verify_param
 from .reserve import reserve
 

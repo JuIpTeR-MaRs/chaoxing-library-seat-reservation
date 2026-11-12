@@ -28,6 +28,9 @@ class NoHolidays:
     def covers(self, _value):
         return True
 
+    def pending_for(self, _value):
+        return None
+
 
 class FakeRequests:
     def __init__(self):
@@ -42,9 +45,13 @@ class FakeRequests:
 class FakeReserve:
     outcomes = {}
     attempts = []
+    reserve_next_day = True
+    created = 0  # booking clients only; the post-run check builds its own
 
-    def __init__(self, **_kwargs):
+    def __init__(self, **kwargs):
         self.requests = FakeRequests()
+        if kwargs.get("reserve_next_day", True):
+            FakeReserve.created += 1
 
     def get_login_status(self):
         pass
@@ -52,12 +59,17 @@ class FakeReserve:
     def login(self, *_args):
         return True, ""
 
-    def submit(self, segment, roomid, seatid, _action):
+    def submit(self, segment, roomid, seatid, _action, prepared=None):
         self.attempts.append((roomid, seatid[0], segment[0]))
         success = self.outcomes.get((roomid, segment[0]), False)
         self.requests.response = {"success": success, "msg": "ok" if success else "occupied"}
         self.requests.post("https://office.chaoxing.com/data/apps/seat/submit")
         return success
+
+
+def last_event(lines, key):
+    """The post-run check appends its own event, so find the last one carrying *key*."""
+    return next(event for event in reversed(lines) if key in event)
 
 
 class BackupTests(unittest.TestCase):
@@ -106,7 +118,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([entry[0] for entry in FakeReserve.attempts], ["101", "101", "202", "202"])
         self.assertEqual([line["plan"] for line in lines if "plan" in line], [1, 1, 2, 2])
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_event(lines, "status")["status"], "complete")
 
     def test_partial_primary_is_filled_without_rebooking_successful_slot(self):
         FakeReserve.outcomes = {("101", "11:00"): True, ("202", "15:00"): True}
@@ -115,7 +127,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(FakeReserve.attempts, [("101", "001", "11:00"),
                                                  ("101", "001", "15:00"),
                                                  ("202", "002", "15:00")])
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_event(lines, "status")["status"], "complete")
 
     def test_backup_time_is_limited_to_primary_target(self):
         user = json.loads(self.config.read_text(encoding="utf-8"))
@@ -126,7 +138,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual([entry[2] for entry in FakeReserve.attempts if entry[0] == "202"],
                          ["11:00", "15:00"])
-        self.assertEqual(lines[-1]["missing"], [["16:00", "19:00"]])
+        self.assertEqual(last_event(lines, "status")["missing"], [["16:00", "19:00"]])
 
     def test_later_backup_only_fills_earlier_backup_gap(self):
         user = json.loads(self.config.read_text(encoding="utf-8"))
@@ -138,7 +150,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(FakeReserve.attempts[-1], ("303", "003", "15:00"))
         self.assertEqual([entry[2] for entry in FakeReserve.attempts if entry[0] == "303"], ["15:00"])
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_event(lines, "status")["status"], "complete")
 
     def test_check_only_lists_plans_without_booking(self):
         code, lines = self.run_cli("--check-only")
@@ -287,40 +299,110 @@ class BackupTests(unittest.TestCase):
 
 
 class GuiBackupSaveTests(unittest.TestCase):
+    def _open_app(self, config):
+        import desktop_gui
+
+        def fake_task_status(action="Inspect", at=None, days=None, account=1,
+                             kind="reserve"):
+            return {"state": "Ready", "at": None, "daysOfWeek": 0,
+                    "nextRunTime": None, "lastRunTime": None, "lastTaskResult": None}
+
+        patches = [patch.object(desktop_gui, "CONFIG_PATH", config),
+                   patch.object(desktop_gui, "task_status", fake_task_status)]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        app = desktop_gui.SeatApp()
+        self.addCleanup(app.destroy)
+        app.withdraw()
+        app.loaded_dept = "1234567890abcdef"
+        app.room_names = {"主区域（11031）": "11031", "备选区域（11032）": "11032"}
+        app._load_rooms = lambda: None
+        return app
+
+    def _write_config(self, directory, **extra):
+        config = Path(directory) / "config.local.json"
+        data = {
+            "deptIdEnc": "1234567890abcdef", "scheduleAt": "22:00",
+            "reserve": [{"username": "test", "password": "test", "roomid": "11031",
+                         "seatid": ["145"], "time": ["11:00", "15:00"],
+                         "daysofweek": ["Monday"], "backups": []}],
+        }
+        data.update(extra)
+        config.write_text(json.dumps(data), encoding="utf-8")
+        return config
+
     @unittest.skipUnless(sys.platform == "win32", "Windows desktop GUI")
     def test_schedule_save_persists_backup_without_touching_real_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_config(directory)
+            app = self._open_app(config)
+            app.schedule_room.set("主区域（11031）")
+            app.schedule_days["Monday"].set(True)
+            app.backup_plans = [{"roomid": "11032", "seatid": ["095"],
+                                 "time": ["18:30", "21:00"]}]
+            app._work = lambda task, done, _status=None: done(task())
+            app._save_schedule()
+            saved = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(saved["reserve"][0]["backups"], app.backup_plans)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows desktop GUI")
+    def test_finishing_the_backup_editor_persists_the_plans(self):
+        """完成编辑 must survive a later account save, which reloads the form."""
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_config(directory)
+            app = self._open_app(config)
+            plans = [{"roomid": "11032", "seatid": ["095"], "time": ["18:30", "21:00"]}]
+            app._write_backup_plans(plans)
+            app.backup_plans = plans
+            app._load_fields()  # what 保存账号 and 切换账号 do
+            self.assertEqual(app.backup_plans, plans)
+            app._work = lambda task, done, _status=None: done(task())
+            app._save_schedule()
+            saved = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(saved["reserve"][0]["backups"], plans)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows desktop GUI")
+    def test_backup_editor_rejects_a_room_from_another_school(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_config(directory)
+            app = self._open_app(config)
+            with self.assertRaisesRegex(ValueError, "备选方案 1"):
+                app._write_backup_plans([{"roomid": "99999", "seatid": ["095"],
+                                          "time": ["18:30", "21:00"]}])
+            saved = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(saved["reserve"][0]["backups"], [])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows desktop GUI")
+    def test_mouse_wheel_does_not_change_the_room_dropdowns(self):
+        """Scrolling over a 阅览区 dropdown must not pick another room."""
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_config(directory)
+            app = self._open_app(config)
+            for combo in (app.room_combo, app.schedule_room_combo):
+                combo.configure(values=["主区域（11031）", "备选区域（11032）"])
+                combo.set("主区域（11031）")
+                combo.event_generate("<MouseWheel>", delta=-120)
+                combo.event_generate("<MouseWheel>", delta=120)
+                self.assertEqual(combo.get(), "主区域（11031）")
+                combo.set("备选区域（11032）")
+                self.assertEqual(combo.get(), "备选区域（11032）")
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows desktop GUI")
+    def test_unsaved_schedule_edits_are_detected(self):
         import desktop_gui
 
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "config.local.json"
-            config.write_text(json.dumps({
-                "deptIdEnc": "1234567890abcdef", "scheduleAt": "22:00",
-                "reserve": [{"username": "test", "password": "test", "roomid": "11031",
-                             "seatid": ["145"], "time": ["11:00", "15:00"],
-                             "daysofweek": ["Monday"]}],
-            }), encoding="utf-8")
-
-            def fake_task_status(action="Inspect", at=None, days=None, account=1):
-                return {"state": "Ready", "at": None, "daysOfWeek": 0,
-                        "nextRunTime": None, "lastRunTime": None, "lastTaskResult": None}
-
-            with patch.object(desktop_gui, "CONFIG_PATH", config), patch.object(
-                    desktop_gui, "task_status", fake_task_status):
-                app = desktop_gui.SeatApp()
-                try:
-                    app.withdraw()
-                    app.loaded_dept = "1234567890abcdef"
-                    app.room_names = {"主区域（11031）": "11031", "备选区域（11032）": "11032"}
-                    app.schedule_room.set("主区域（11031）")
-                    app.schedule_days["Monday"].set(True)
-                    app.backup_plans = [{"roomid": "11032", "seatid": ["095"],
-                                         "time": ["18:30", "21:00"]}]
-                    app._work = lambda task, done, _status=None: done(task())
-                    app._save_schedule()
-                    saved = json.loads(config.read_text(encoding="utf-8"))
-                    self.assertEqual(saved["reserve"][0]["backups"], app.backup_plans)
-                finally:
-                    app.destroy()
+            config = self._write_config(directory)
+            app = self._open_app(config)
+            app._load_fields()
+            self.assertFalse(app._schedule_dirty())
+            app.schedule_seat.set("187")
+            self.assertTrue(app._schedule_dirty())
+            with patch.object(desktop_gui.messagebox, "askyesno", return_value=False):
+                app._select_account()
+            self.assertEqual(app.account_index, 0)
+            self.assertFalse(app.busy)
 
 
 if __name__ == "__main__":

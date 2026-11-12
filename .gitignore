@@ -106,7 +106,14 @@ celerybeat.pid
 config.local.json
 scheduled-account.lock
 scheduled-account-state.json
+scheduled-run.lock
+scheduled-run-state.json
+seat-transfer.lock
+seat-transfer-state.json
 last-run.log
+last-run-*.log
+last-transfer.log
+logs/
 .venv
 .venv-new/
 .venv-repaired/

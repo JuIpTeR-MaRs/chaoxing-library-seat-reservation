@@ -64,6 +64,16 @@ class AccessRetryTests(unittest.TestCase):
         self.assertEqual(result.status_code, 400)
         self.assertEqual(session.calls, 1)
 
+    def test_cap_lowered_after_wrapping_is_read_on_every_attempt(self):
+        """The fast sprint lowers the cap right after the tracer wraps the session."""
+        session = FakeSession([requests.exceptions.Timeout() for _ in range(6)])
+        with patch.object(reserve_segments.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+            reserve_segments.trace_http_timings(session)
+            session.temporary_retry_attempts = 1
+            with self.assertRaises(requests.exceptions.Timeout):
+                session.request("POST", "https://example.com/submit")
+        self.assertEqual(session.calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

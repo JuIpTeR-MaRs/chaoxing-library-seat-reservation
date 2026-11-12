@@ -36,6 +36,9 @@ class FakeCalendar:
     def covers(self, value):
         return holidays.as_date(value).year in self.years
 
+    def pending_for(self, _value):
+        return None
+
     def upcoming(self, start, end):
         first, last = holidays.as_date(start), holidays.as_date(end)
         return [(day, info["kind"], info["name"]) for day, info in sorted(self.adjustments.items())
@@ -50,12 +53,14 @@ class FakeRequests:
 
 
 class FakeReserve:
-    created = 0
+    created = 0  # booking clients only; the post-run check builds its own
     attempts = []
+    reserve_next_day = True
 
-    def __init__(self, **_kwargs):
-        FakeReserve.created += 1
+    def __init__(self, **kwargs):
         self.requests = FakeRequests()
+        if kwargs.get("reserve_next_day", True):
+            FakeReserve.created += 1
 
     def get_login_status(self):
         pass
@@ -63,10 +68,15 @@ class FakeReserve:
     def login(self, *_args):
         return True, ""
 
-    def submit(self, segment, roomid, seatid, _action):
+    def submit(self, segment, roomid, seatid, _action, prepared=None):
         FakeReserve.attempts.append((roomid, seatid[0], segment[0]))
         self.requests.post("https://office.chaoxing.com/data/apps/seat/submit")
         return True
+
+
+def last_status(lines):
+    """The post-run check appends its own event, so find the last status."""
+    return next(event["status"] for event in reversed(lines) if "status" in event)
 
 
 class HolidaySkipTests(unittest.TestCase):
@@ -117,21 +127,21 @@ class HolidaySkipTests(unittest.TestCase):
                                       calendar=FakeCalendar({TOMORROW: "春节"}))
         self.assertEqual(code, 0)
         self.assertEqual(FakeReserve.created, 1)
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_status(lines), "complete")
 
     def test_config_can_turn_holiday_skip_off(self):
         self.write_config(skipHolidays=False)
         code, lines, _ = self.run_cli("--ignore-weekday", calendar=FakeCalendar({TOMORROW: "春节"}))
         self.assertEqual(code, 0)
         self.assertEqual(FakeReserve.created, 1)
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_status(lines), "complete")
 
     def test_working_day_reserves_as_before(self):
         self.write_config()
         code, lines, _ = self.run_cli("--ignore-weekday", calendar=FakeCalendar())
         self.assertEqual(code, 0)
         self.assertEqual(FakeReserve.created, 1)
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_status(lines), "complete")
 
     def test_check_only_reports_holiday_without_booking(self):
         self.write_config()
@@ -163,7 +173,7 @@ class HolidaySkipTests(unittest.TestCase):
         code, lines, errors = self.run_cli("--ignore-weekday", calendar=calendar)
         self.assertEqual(code, 0)
         self.assertEqual(FakeReserve.created, 1)
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_status(lines), "complete")
         self.assertIn("adjusted workday", errors)
 
     def test_saved_skip_decision_stops_adjusted_day(self):
@@ -180,7 +190,7 @@ class HolidaySkipTests(unittest.TestCase):
         code, lines, _ = self.run_cli("--ignore-weekday", calendar=FakeCalendar({TOMORROW: "国庆节"}))
         self.assertEqual(code, 0)
         self.assertEqual(FakeReserve.created, 1)
-        self.assertEqual(lines[-1]["status"], "complete")
+        self.assertEqual(last_status(lines), "complete")
 
     def test_check_only_reports_adjustment_and_decision(self):
         self.write_config(adjustments={str(TOMORROW): "skip"})
@@ -200,7 +210,7 @@ class HolidayDataTests(unittest.TestCase):
         calendar = holidays.load_calendar(self.project_file)
         self.assertIsNone(calendar.error)
         self.assertEqual(calendar.name(dt.date(2026, 1, 1)), "元旦")
-        self.assertEqual(calendar.name(dt.date(2026, 2, 17)), "春节")
+        self.assertEqual(calendar.name(dt.date(2026, 2, 17)), "初一")
         self.assertEqual(calendar.name(dt.date(2026, 10, 2)), "国庆节")
         self.assertIsNone(calendar.name(dt.date(2026, 10, 23)))
         self.assertTrue(calendar.covers(dt.date(2026, 6, 1)))
@@ -279,7 +289,8 @@ class GuiHolidaySaveTests(unittest.TestCase):
                              "daysofweek": ["Monday"]}],
             }), encoding="utf-8")
 
-            def fake_task_status(action="Inspect", at=None, days=None, account=1):
+            def fake_task_status(action="Inspect", at=None, days=None, account=1,
+                                 kind="reserve"):
                 return {"state": "Ready", "at": None, "daysOfWeek": 0,
                         "nextRunTime": None, "lastRunTime": None, "lastTaskResult": None}
 
@@ -315,7 +326,8 @@ class GuiHolidaySaveTests(unittest.TestCase):
                              "daysofweek": ["Monday"]}],
             }), encoding="utf-8")
 
-            def fake_task_status(action="Inspect", at=None, days=None, account=1):
+            def fake_task_status(action="Inspect", at=None, days=None, account=1,
+                                 kind="reserve"):
                 return {"state": "Ready", "at": None, "daysOfWeek": 0,
                         "nextRunTime": None, "lastRunTime": None, "lastTaskResult": None}
 

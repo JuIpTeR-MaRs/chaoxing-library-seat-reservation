@@ -16,9 +16,10 @@ from urllib.parse import parse_qs, urlparse
 
 from query_available_seats import LOCAL_TZ, available_seats, list_rooms
 from reservation_records import cancel_reservation, list_reservations
-from reserve_segments import build_segments
-from run_log_view import format_run_log
-from utils import holidays, reserve
+from reserve_segments import TIMES_BY_WEEKDAY_KEY, build_segments
+from run_log_view import format_run_log, format_transfer_log
+from transfer_seats import TRANSFER_KEY, transfer_settings
+from utils import holidays, holiday_update, reserve
 
 
 ROOT = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
@@ -53,10 +54,10 @@ def load_config():
         return json.load(file)
 
 
-def task_status(action="Inspect", at=None, days=None, account=1):
+def task_status(action="Inspect", at=None, days=None, account=1, kind="reserve"):
     command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                "-File", str(ROOT / "schedule_task.ps1"), "-Action", action,
-               "-Account", str(account)]
+               "-Account", str(account), "-Kind", kind]
     if action == "Set":
         command += ["-At", at, "-Days", ",".join(days)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=30,
@@ -241,6 +242,7 @@ class SeatApp(tk.Tk):
         self.saved_username = ""
         self.account_index = 0
         self._loading_account = False
+        self._loaded_schedule = None
         self._style()
         self._build()
         self._load_fields()
@@ -365,6 +367,7 @@ class SeatApp(tk.Tk):
         room_box.grid(row=4, column=0, sticky="ew", padx=(0, 14), pady=(5, 12))
         self.room_combo = ttk.Combobox(room_box, textvariable=self.room, values=list(ROOMS), width=26)
         self.room_combo.pack(side="left", fill="x", expand=True)
+        self._block_mouse_wheel(self.room_combo)
         self.refresh_rooms_button = ttk.Button(room_box, text="刷新区域", command=self._load_rooms)
         self.refresh_rooms_button.pack(side="left", padx=(8, 0))
         ttk.Label(search, text="预约日期", style="Field.TLabel").grid(row=3, column=1, sticky="w")
@@ -449,6 +452,8 @@ class SeatApp(tk.Tk):
         self.schedule_seat = tk.StringVar(value="150")
         self.schedule_start = tk.StringVar(value="11:00")
         self.schedule_end = tk.StringVar(value="21:00")
+        self.weekday_times = {}
+        self.weekday_summary = tk.StringVar(value="按星期：未设置，每天沿用上面的时段")
         self.backup_plans = []
         self.backup_summary = tk.StringVar(value="备选方案（0）")
         self.schedule_days = {name: tk.BooleanVar() for name, _ in WEEKDAYS}
@@ -458,6 +463,7 @@ class SeatApp(tk.Tk):
         ttk.Label(form, text="阅览区", style="Field.TLabel").grid(row=0, column=1, sticky="w")
         self.schedule_room_combo = ttk.Combobox(form, textvariable=self.schedule_room, values=list(ROOMS))
         self.schedule_room_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(5, 15))
+        self._block_mouse_wheel(self.schedule_room_combo)
         ttk.Label(form, text="座位号", style="Field.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Entry(form, textvariable=self.schedule_seat).grid(row=3, column=0, sticky="ew", padx=(0, 14), pady=(5, 15))
         ttk.Label(form, text="次日预约开始", style="Field.TLabel").grid(row=2, column=1, sticky="w")
@@ -466,22 +472,40 @@ class SeatApp(tk.Tk):
         ttk.Label(form, text="次日预约结束", style="Field.TLabel").grid(row=2, column=2, sticky="w")
         schedule_end_picker = self._time_picker(form, self.schedule_end)
         schedule_end_picker.grid(row=3, column=2, sticky="w", pady=(5, 15))
-        ttk.Label(form, text="执行星期（预约次日）", style="Field.TLabel").grid(row=4, column=0, columnspan=3, sticky="w")
+        ttk.Button(form, text="按星期设置时段…", command=self._edit_weekday_times).grid(
+            row=4, column=0, sticky="w", pady=(0, 15))
+        ttk.Label(form, textvariable=self.weekday_summary, style="SurfaceHint.TLabel",
+                  justify="left", wraplength=520).grid(row=4, column=1, columnspan=2,
+                                                       sticky="w", pady=(0, 15))
+        ttk.Label(form, text="执行星期（预约次日）", style="Field.TLabel").grid(row=5, column=0, columnspan=3, sticky="w")
         days_frame = ttk.Frame(form, style="Surface.TFrame")
-        days_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=(5, 15))
+        days_frame.grid(row=6, column=0, columnspan=3, sticky="w", pady=(5, 15))
         for name, label in WEEKDAYS:
             ttk.Checkbutton(days_frame, text=label, variable=self.schedule_days[name]).pack(side="left", padx=(0, 18))
         self.skip_holidays = tk.BooleanVar(value=True)
         ttk.Checkbutton(form, text="法定节假日不预约", variable=self.skip_holidays,
-                        command=self._update_holiday_hint).grid(row=6, column=0, sticky="w", pady=(0, 6))
+                        command=self._update_holiday_hint).grid(row=7, column=0, sticky="w", pady=(0, 6))
         self.holiday_hint = tk.StringVar()
         ttk.Label(form, textvariable=self.holiday_hint, justify="left",
-                  style="SurfaceHint.TLabel").grid(row=7, column=0, columnspan=3, sticky="w")
+                  style="SurfaceHint.TLabel").grid(row=8, column=0, columnspan=3, sticky="w")
         self.auto_cancel_other = tk.BooleanVar(value=False)
         ttk.Checkbutton(form, text="任一账号定时预约成功后，另一账号不再预约同一天",
-                        variable=self.auto_cancel_other).grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
+                        variable=self.auto_cancel_other).grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Label(form, text="个人设置 · 两个账号共用；以首个成功时段为准，避免重复预约。",
-                  style="SurfaceHint.TLabel").grid(row=9, column=0, columnspan=3, sticky="w")
+                  style="SurfaceHint.TLabel").grid(row=10, column=0, columnspan=3, sticky="w")
+        transfer_row = ttk.Frame(form, style="Surface.TFrame")
+        transfer_row.grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.transfer_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(transfer_row, text="账号2全部约到后，把预约转给账号1（取消再重新预约）",
+                        variable=self.transfer_enabled).pack(side="left")
+        ttk.Label(transfer_row, text="转预约时间", style="Field.TLabel").pack(
+            side="left", padx=(14, 0))
+        self.transfer_at = tk.StringVar(value="22:30")
+        self._time_picker(transfer_row, self.transfer_at).pack(side="left", padx=(6, 0))
+        ttk.Label(form, text="个人设置 · 两个账号共用。账号1已全部约到则只取消账号2；账号1只约到部分而"
+                             "账号2全部约到，则先取消账号1再转。需两个账号都已保存定时预约。",
+                  style="SurfaceHint.TLabel", justify="left", wraplength=640).grid(
+            row=12, column=0, columnspan=3, sticky="w")
         form.columnconfigure(0, weight=1)
         form.columnconfigure(1, weight=2)
         form.columnconfigure(2, weight=1)
@@ -524,7 +548,9 @@ class SeatApp(tk.Tk):
         self.schedule_save_button.pack(side="left")
         ttk.Button(controls, textvariable=self.backup_summary, command=self._edit_backups).pack(side="left", padx=(10, 0))
         ttk.Button(controls, text="刷新任务状态", command=self._refresh_schedule).pack(side="left", padx=(12, 0))
+        ttk.Button(controls, text="更新节假日表", command=self._update_holiday_table).pack(side="left", padx=(12, 0))
         ttk.Button(controls, text="查看运行日志", command=self._show_run_log).pack(side="left", padx=(12, 0))
+        ttk.Button(controls, text="查看转预约日志", command=self._show_transfer_log).pack(side="left", padx=(12, 0))
         self.schedule_status = tk.StringVar(value="点击“刷新任务状态”查看下一次运行时间。")
         ttk.Label(schedule_tab, text="任务状态", style="Section.TLabel").pack(anchor="w", pady=(10, 5))
         ttk.Label(schedule_tab, textvariable=self.schedule_status, justify="left", style="Surface.TLabel").pack(anchor="w")
@@ -532,7 +558,7 @@ class SeatApp(tk.Tk):
                   style="SurfaceHint.TLabel").pack(anchor="w", pady=(12, 0))
         ttk.Label(schedule_tab, text="法定节假日按 holidays.json 判断；命中时任务直接跳过、不提交预约，"
                                      "日志会记录 skipped 原因。调休日不会自动跳过，在上方逐日决定即可；"
-                                     "两类日期都可在该文件中按官方通知修改。",
+                                     "节假日数据可点“更新节假日表”按国务院通知自动获取，也可手工修改该文件。",
                   style="SurfaceHint.TLabel", justify="left").pack(anchor="w", pady=(4, 0))
 
         self.status = tk.StringVar(value="就绪")
@@ -547,6 +573,12 @@ class SeatApp(tk.Tk):
         if isinstance(event.widget, (ttk.Treeview, ttk.Combobox)):
             return
         self.content_canvas.yview_scroll(-int(event.delta / 120), "units")
+
+    @staticmethod
+    def _block_mouse_wheel(widget):
+        """Only a click may change a dropdown; the wheel must not pick an item."""
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, lambda _event: "break")
 
     @staticmethod
     def _time_picker(parent, value):
@@ -656,6 +688,13 @@ class SeatApp(tk.Tk):
                 self.end.set("23:59")
             self.schedule_at.set(account.get("scheduleAt", data.get("scheduleAt", "22:00")))
             self.auto_cancel_other.set(data.get("autoCancelOtherOnSuccess") is True)
+            try:
+                transfer = transfer_settings(data)
+                self.transfer_enabled.set(transfer["enabled"])
+                self.transfer_at.set(transfer["at"])
+            except ValueError:
+                self.transfer_enabled.set(False)
+                self.transfer_at.set("22:30")
             self.schedule_room.set(str(account.get("roomid", "")))
             seats = account.get("seatid") or []
             self.schedule_seat.set(str(seats[0]) if seats else "")
@@ -665,6 +704,14 @@ class SeatApp(tk.Tk):
                 self.schedule_end.set(period[1])
             self.backup_plans = list(account.get("backups") or [])
             self.backup_summary.set(f"备选方案（{len(self.backup_plans)}）")
+            self.weekday_times = {}
+            raw_weekday_times = account.get(TIMES_BY_WEEKDAY_KEY)
+            if isinstance(raw_weekday_times, dict):
+                known = dict(WEEKDAYS)
+                for name, value in raw_weekday_times.items():
+                    if name in known and isinstance(value, (list, tuple)) and len(value) == 2:
+                        self.weekday_times[name] = [str(value[0]), str(value[1])]
+            self._update_weekday_summary()
             for name, _ in WEEKDAYS:
                 self.schedule_days[name].set(name in account.get("daysofweek", []))
             skip_holidays = account.get("skipHolidays", data.get("skipHolidays", True))
@@ -675,6 +722,7 @@ class SeatApp(tk.Tk):
             self.status.set(f"读取本机账号配置失败：{error}")
         self._update_holiday_hint()
         self._refresh_adjustments()
+        self._loaded_schedule = self._schedule_state()
 
     def _update_holiday_hint(self):
         tomorrow = dt.datetime.now(LOCAL_TZ).date() + dt.timedelta(days=1)
@@ -688,10 +736,42 @@ class SeatApp(tk.Tk):
             self.holiday_hint.set(f"明天 {tomorrow:%Y-%m-%d} 是法定节假日（{name}），任务{action}预约。")
         elif not holiday_calendar.covers(tomorrow):
             self.holiday_hint.set(
-                f"节假日表未覆盖 {tomorrow.year} 年，请在 {holiday_calendar.path.name} 中补充。")
+                f"节假日表未覆盖 {tomorrow.year} 年，请在 {holiday_calendar.path.name} 中补充，"
+                "或点“更新节假日表”自动获取。")
+        elif holiday_calendar.pending_for(tomorrow):
+            self.holiday_hint.set(
+                f"明天 {tomorrow:%Y-%m-%d} 在 {holiday_calendar.pending_for(tomorrow)} 放假区间内，"
+                "但法定节假日日期尚未确认（等待数据源更新），任务会照常预约。")
         else:
             self.holiday_hint.set(
                 f"明天 {tomorrow:%Y-%m-%d} 不是法定节假日；节假日表：{holiday_calendar.path.name}。")
+
+    def _update_holiday_table(self):
+        """Fetch the official arrangement in the background, then write it after a preview."""
+        today = dt.datetime.now(LOCAL_TZ).date()
+        years = [today.year, today.year + 1]
+
+        def task():
+            return holiday_update.fetch_all(years, timeout=10)
+
+        self._work(task, self._apply_holiday_table, status="正在获取国务院节假日安排…")
+
+    def _apply_holiday_table(self, results):
+        lines = holiday_update.describe(results)
+        if any(item.get("error") for item in results):
+            messagebox.showerror("更新节假日表", "\n".join(lines), parent=self)
+            return
+        if not messagebox.askyesno("更新节假日表",
+                                   "\n".join(lines) + "\n\n确认写入 holidays.json？", parent=self):
+            return
+        try:
+            summary = holiday_update.apply(holidays.default_path(), results)
+        except OSError as error:
+            messagebox.showerror("更新失败", f"无法写入 holidays.json：{error}", parent=self)
+            return
+        self._update_holiday_hint()
+        self._refresh_adjustments()
+        self.status.set("节假日表已是最新。" if not summary["written"] else "节假日表已更新。")
 
     def _refresh_adjustments(self):
         holiday_calendar = holidays.calendar()
@@ -765,11 +845,49 @@ class SeatApp(tk.Tk):
     def _toggle_password(self):
         self.password_entry.configure(show="" if self.show_password.get() else "●")
 
+    def _schedule_state(self):
+        """The schedule tab's current values, or None when they cannot be read."""
+        try:
+            return {
+                "roomid": parse_room(self.schedule_room.get()),
+                "seatid": [self.schedule_seat.get().strip().zfill(3)]
+                          if self.schedule_seat.get().strip() else [],
+                "time": [self.schedule_start.get(), self.schedule_end.get()],
+                "daysofweek": [name for name, _ in WEEKDAYS if self.schedule_days[name].get()],
+                "scheduleAt": self.schedule_at.get(),
+                "backups": [dict(plan) for plan in self.backup_plans],
+                "weekday": {name: list(value) for name, value in self.weekday_times.items()},
+                "skipHolidays": bool(self.skip_holidays.get()),
+                "transfer": [bool(self.transfer_enabled.get()), self.transfer_at.get().strip()],
+            }
+        except (ValueError, KeyError):
+            return None
+
+    def _schedule_dirty(self):
+        """True when the form holds edits that are not in the loaded snapshot.
+
+        Comparing with the values loaded into the form (not with the live file)
+        matters: the config file can legitimately be changed from outside while
+        this window is open (for example by the user editing it or by the
+        transfer setup), and that must not look like an unsaved edit here.
+        """
+        loaded = getattr(self, "_loaded_schedule", None)
+        current = self._schedule_state()
+        return current is None or current != loaded
+
     def _select_account(self, _event=None):
         if self.busy:
             self.account_choice.set(self.account_combo["values"][self.account_index])
             return
         if not self._save_manual_settings():
+            self.account_choice.set(self.account_combo["values"][self.account_index])
+            return
+        if self._schedule_dirty() and not messagebox.askyesno(
+                "放弃未保存的修改？",
+                "定时预约页有未保存的修改，切换账号会丢弃它们。\n"
+                "选“是”继续切换；选“否”留在当前账号。\n"
+                "（如果你没有改过这个页面，选“是”即可。）",
+                parent=self):
             self.account_choice.set(self.account_combo["values"][self.account_index])
             return
         self.account_index = self.account_combo.current()
@@ -797,6 +915,13 @@ class SeatApp(tk.Tk):
             return False
 
     def _close(self):
+        if self._schedule_dirty() and not messagebox.askyesno(
+                "放弃未保存的修改？",
+                "定时预约页有未保存的修改，关闭窗口会丢弃它们。\n"
+                "选“是”继续关闭；选“否”返回。\n"
+                "（如果你没有改过这个页面，选“是”即可。）",
+                parent=self):
+            return
         if self._save_manual_settings():
             self.destroy()
 
@@ -822,6 +947,13 @@ class SeatApp(tk.Tk):
 
     def _save_account(self):
         if not self._save_manual_settings():
+            return
+        if self._schedule_dirty() and not messagebox.askyesno(
+                "放弃未保存的修改？",
+                "定时预约页有未保存的修改，保存账号会重新载入该页并丢弃它们。\n"
+                "选“是”继续；选“否”返回。\n"
+                "（如果你没有改过这个页面，选“是”即可。）",
+                parent=self):
             return
         username = self.username.get().strip()
         password = self.password.get()
@@ -1107,21 +1239,69 @@ class SeatApp(tk.Tk):
             return
         self._update_holiday_hint()
         self._refresh_adjustments()
-        self._work(lambda: task_status(account=self.account_index + 1), self._show_schedule_status,
-                   "正在读取 Windows 定时任务…")
+        self._work(lambda: (task_status(account=self.account_index + 1),
+                            task_status(kind="transfer")),
+                   self._show_schedule_status, "正在读取 Windows 定时任务…")
+
+    @staticmethod
+    def _task_schedule(info):
+        """Inspect output -> (HH:MM time, weekday names) of one task."""
+        at = (dt.datetime.fromisoformat(info["at"]).strftime("%H:%M")
+              if info.get("at") else None)
+        mask = info.get("daysOfWeek") or 0
+        days = [name for index, (name, _) in enumerate(WEEKDAYS) if mask & (1 << index)]
+        return at, days
+
+    @staticmethod
+    def _transfer_task_line(info):
+        if not info or info.get("state") == "Missing":
+            return "转预约任务：未创建（设置里未启用）"
+        next_run = info.get("nextRunTime") or "未安排"
+        last_run = info.get("lastRunTime") or "尚未运行"
+        return (f"转预约任务：{info.get('state')}；下次执行：{next_run}；"
+                f"上次执行：{last_run}")
 
     def _show_schedule_status(self, result):
-        next_run = result.get("nextRunTime") or "未安排"
-        last_run = result.get("lastRunTime") or "尚未运行"
-        code = result["lastTaskResult"]
+        if isinstance(result, tuple):
+            reserve_result, transfer_info = result
+        else:
+            reserve_result, transfer_info = result, None
+        next_run = reserve_result.get("nextRunTime") or "未安排"
+        last_run = reserve_result.get("lastRunTime") or "尚未运行"
+        code = reserve_result["lastTaskResult"]
         last_result = ("尚无结果" if code is None else "运行结束，请查看预约结果" if code == 0
                        else "预约未全部完成或运行出错，请查看运行日志" if code == 1
                        else "任务被终止" if code == 267014 else f"结果代码 {code}；请查看运行日志")
-        self.schedule_status.set(
-            f"任务：{result['state']}\n下次执行：{next_run}\n"
-            f"上次执行：{last_run}；{last_result}"
-        )
+        text = (f"任务：{reserve_result['state']}\n下次执行：{next_run}\n"
+                f"上次执行：{last_run}；{last_result}")
+        if transfer_info is not None:
+            text += "\n" + self._transfer_task_line(transfer_info)
+        self.schedule_status.set(text)
         self.status.set("定时任务状态已更新。")
+
+    def _show_transfer_log(self):
+        try:
+            path = ROOT / "last-transfer.log"
+            content = format_transfer_log(path.read_text(encoding="utf-8-sig"),
+                                          dt.datetime.fromtimestamp(
+                                              path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"))
+        except FileNotFoundError:
+            content = "尚无转预约日志；当天 22:30 的转预约任务运行后会生成。"
+        except OSError as error:
+            content = f"读取日志失败：{error}"
+        dialog = tk.Toplevel(self)
+        dialog.title("转预约结果")
+        dialog.geometry("700x520")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, wrap="word", font=("Microsoft YaHei UI", 11), padx=14, pady=14)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        text.insert("1.0", content)
+        text.configure(state="disabled")
 
     def _show_run_log(self):
         try:
@@ -1146,6 +1326,30 @@ class SeatApp(tk.Tk):
         text.pack(side="left", fill="both", expand=True)
         text.insert("1.0", content)
         text.configure(state="disabled")
+
+    def _write_backup_plans(self, plans):
+        """Store the backup plans of the current account right away.
+
+        The dialog used to keep them in memory only until "保存定时预约" ran, so
+        switching accounts, saving the account (which reloads the form) or closing
+        the window silently dropped them. Writing here keeps the config in step
+        with what the user just confirmed.
+        """
+        backups = []
+        for index, plan in enumerate(plans, start=1):
+            backup_room = str(plan["roomid"])
+            backup_seat = str(plan["seatid"][0])
+            backup_start, backup_end = plan["time"]
+            if backup_room not in self.room_names.values() or not backup_seat.isdecimal() or int(backup_seat) < 1:
+                raise ValueError(f"备选方案 {index} 的区域或座位无效，请重新编辑。")
+            build_segments(backup_start, backup_end)
+            backups.append({"roomid": backup_room, "seatid": [backup_seat.zfill(3)],
+                            "time": [backup_start, backup_end]})
+        data = load_config()
+        data["reserve"][self.account_index]["backups"] = backups
+        with CONFIG_PATH.open("w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.write("\n")
 
     def _edit_backups(self):
         try:
@@ -1187,8 +1391,9 @@ class SeatApp(tk.Tk):
         ttk.Label(editor, text="座位号", style="Field.TLabel").grid(row=0, column=1, sticky="w", padx=(10, 0))
         ttk.Label(editor, text="开始", style="Field.TLabel").grid(row=0, column=2, sticky="w", padx=(10, 0))
         ttk.Label(editor, text="结束", style="Field.TLabel").grid(row=0, column=3, sticky="w", padx=(10, 0))
-        ttk.Combobox(editor, textvariable=room_var, values=list(self.room_names), state="readonly").grid(
-            row=1, column=0, sticky="ew", pady=(5, 0))
+        room_combo = ttk.Combobox(editor, textvariable=room_var, values=list(self.room_names), state="readonly")
+        room_combo.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        self._block_mouse_wheel(room_combo)
         ttk.Entry(editor, textvariable=seat_var, width=9).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(5, 0))
         start_picker = self._time_picker(editor, start_var)
         start_picker.grid(row=1, column=2, padx=(10, 0), pady=(5, 0))
@@ -1274,13 +1479,98 @@ class SeatApp(tk.Tk):
         ttk.Button(actions, text="下移", command=lambda: move(1)).pack(side="left", padx=(7, 0))
 
         def save():
+            try:
+                self._write_backup_plans(plans)
+            except (ValueError, OSError, KeyError, IndexError) as error:
+                messagebox.showerror("保存备选方案失败", str(error), parent=dialog)
+                return
             self.backup_plans = plans
             self.backup_summary.set(f"备选方案（{len(plans)}）")
+            self._loaded_schedule = self._schedule_state()
+            self.status.set(f"备选方案已保存（{len(plans)} 个）。")
             dialog.destroy()
 
+        def close():
+            if plans != self.backup_plans and not messagebox.askyesno(
+                    "放弃修改？", "备选方案有未保存的修改，关闭后不会生效。要放弃吗？", parent=dialog):
+                return
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close)
         ttk.Button(actions, text="完成编辑", style="Accent.TButton", command=save).pack(side="right")
-        ttk.Label(body, text="完成编辑后，请回到主窗口点击“保存定时预约”才会写入配置。",
+        ttk.Label(body, text="点“完成编辑”会立即写入配置；“保存定时预约”再一并保存时段、星期与执行时间。",
                   style="Hint.TLabel").pack(anchor="w", pady=(9, 0))
+
+    def _update_weekday_summary(self):
+        labels = dict(WEEKDAYS)
+        ordered = [name for name, _ in WEEKDAYS if name in self.weekday_times]
+        if not ordered:
+            self.weekday_summary.set("按星期：未设置，每天沿用上面的时段")
+            return
+        parts = [f"{labels[name]} {'–'.join(self.weekday_times[name])}" for name in ordered]
+        self.weekday_summary.set("按星期：" + "、".join(parts) + "；其余星期沿用上面的时段")
+
+    def _edit_weekday_times(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("按星期设置预约时段")
+        dialog.geometry("500x440")
+        dialog.minsize(460, 400)
+        dialog.configure(bg=COLORS["canvas"])
+        dialog.transient(self)
+        dialog.grab_set()
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="按预约日星期设置时段", style="Eyebrow.TLabel").pack(anchor="w")
+        ttk.Label(body, text="勾选后按该行时段预约那一天；未勾选的星期沿用“次日预约开始/结束”。"
+                             "时段指被预约的那一天（通常是次日）。",
+                  style="Hint.TLabel", justify="left", wraplength=440).pack(anchor="w", pady=(4, 12))
+        grid = ttk.Frame(body, style="Surface.TFrame")
+        grid.pack(fill="x")
+        labels = dict(WEEKDAYS)
+        rows = {}
+        for index, (name, label) in enumerate(WEEKDAYS):
+            current = self.weekday_times.get(name) or [self.schedule_start.get(), self.schedule_end.get()]
+            enabled = tk.BooleanVar(value=name in self.weekday_times)
+            start = tk.StringVar(value=current[0])
+            end = tk.StringVar(value=current[1])
+            ttk.Checkbutton(grid, text=label, variable=enabled).grid(
+                row=index, column=0, sticky="w", pady=3)
+            self._time_picker(grid, start).grid(row=index, column=1, padx=(10, 0), pady=3)
+            ttk.Label(grid, text="至", style="SurfaceHint.TLabel").grid(
+                row=index, column=2, padx=6, pady=3)
+            self._time_picker(grid, end).grid(row=index, column=3, pady=3)
+            rows[name] = (enabled, start, end)
+        grid.columnconfigure(4, weight=1)
+
+        def clear_all():
+            for enabled, _start, _end in rows.values():
+                enabled.set(False)
+
+        def confirm():
+            chosen = {}
+            for name, (enabled, start, end) in rows.items():
+                if not enabled.get():
+                    continue
+                try:
+                    start_text = dt.datetime.strptime(start.get().strip(), "%H:%M").strftime("%H:%M")
+                    end_text = dt.datetime.strptime(end.get().strip(), "%H:%M").strftime("%H:%M")
+                except ValueError:
+                    messagebox.showerror("时间有误", f"{labels[name]}的时间应为 HH:MM。", parent=dialog)
+                    return
+                if end_text <= start_text:
+                    messagebox.showerror("时间有误", f"{labels[name]}的结束时间必须晚于开始时间。",
+                                         parent=dialog)
+                    return
+                chosen[name] = [start_text, end_text]
+            self.weekday_times = chosen
+            self._update_weekday_summary()
+            dialog.destroy()
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(14, 0))
+        ttk.Button(actions, text="全部清除", command=clear_all).pack(side="left")
+        ttk.Button(actions, text="确定", style="Accent.TButton", command=confirm).pack(side="right")
+        ttk.Button(actions, text="取消", command=dialog.destroy).pack(side="right", padx=(0, 8))
 
     def _save_schedule(self):
         if self.busy:
@@ -1306,6 +1596,18 @@ class SeatApp(tk.Tk):
             days = [name for name, _ in WEEKDAYS if self.schedule_days[name].get()]
             if not days:
                 raise ValueError("请至少选择一个执行星期。")
+            weekday_times = {}
+            weekday_labels = dict(WEEKDAYS)
+            for name, value in self.weekday_times.items():
+                if name not in weekday_labels or not isinstance(value, (list, tuple)) or len(value) != 2:
+                    raise ValueError(f"按星期时段有误：{name}")
+                try:
+                    weekday_start = dt.datetime.strptime(str(value[0]).strip(), "%H:%M").strftime("%H:%M")
+                    weekday_end = dt.datetime.strptime(str(value[1]).strip(), "%H:%M").strftime("%H:%M")
+                except ValueError:
+                    raise ValueError(f"{weekday_labels[name]}的按星期时段格式应为 HH:MM。") from None
+                build_segments(weekday_start, weekday_end)
+                weekday_times[name] = [weekday_start, weekday_end]
             original = load_config()
             updated = json.loads(json.dumps(original))
             if any(item.get("username") == username for index, item in enumerate(updated["reserve"])
@@ -1328,12 +1630,41 @@ class SeatApp(tk.Tk):
                 backups.append({"roomid": backup_room, "seatid": [backup_seat.zfill(3)],
                                 "time": [backup_start, backup_end]})
             item["backups"] = backups
+            if weekday_times:
+                item[TIMES_BY_WEEKDAY_KEY] = weekday_times
+            else:
+                item.pop(TIMES_BY_WEEKDAY_KEY, None)
             item["deptIdEnc"] = dept_id_enc
             if self.account_index == 0:
                 updated["deptIdEnc"] = dept_id_enc
             item["scheduleAt"] = at
             item["skipHolidays"] = bool(self.skip_holidays.get())
             updated["autoCancelOtherOnSuccess"] = bool(self.auto_cancel_other.get())
+            try:
+                transfer_at = dt.datetime.strptime(self.transfer_at.get().strip(),
+                                                   "%H:%M").strftime("%H:%M")
+            except ValueError:
+                raise ValueError("转预约时间应为 HH:MM。") from None
+            transfer_enabled = bool(self.transfer_enabled.get())
+            try:
+                current_transfer = transfer_settings(original)
+            except ValueError:
+                current_transfer = {"from": 2, "to": 1}
+            transfer_from, transfer_to = current_transfer["from"], current_transfer["to"]
+            if transfer_enabled:
+                if len(updated["reserve"]) < 2:
+                    raise ValueError("转预约需要至少两个账号。")
+                if not (1 <= transfer_from <= len(updated["reserve"])
+                        and 1 <= transfer_to <= len(updated["reserve"])
+                        and transfer_from != transfer_to):
+                    raise ValueError("转预约的 from/to 账号序号无效。")
+                source_at = str(updated["reserve"][transfer_from - 1]
+                                .get("scheduleAt") or "22:00")
+                if transfer_at <= source_at:
+                    raise ValueError(
+                        f"转预约时间要晚于账号 {transfer_from} 的执行时间（{source_at}）。")
+            updated[TRANSFER_KEY] = {"enabled": transfer_enabled, "from": transfer_from,
+                                     "to": transfer_to, "at": transfer_at}
             task_days = days
         except (ValueError, KeyError, IndexError, OSError) as error:
             messagebox.showerror("定时设置有误", str(error), parent=self)
@@ -1344,29 +1675,64 @@ class SeatApp(tk.Tk):
                 json.dump(data, file, ensure_ascii=False, indent=2)
                 file.write("\n")
 
+        def sync_transfer_task(data):
+            """Create, update or remove the shared 22:30 transfer task."""
+            settings = transfer_settings(data)
+            if not settings["enabled"]:
+                task_status("Remove", kind="transfer")
+                return
+            source = data["reserve"][settings["from"] - 1]
+            source_days = [name for name, _ in WEEKDAYS
+                           if name in (source.get("daysofweek") or [])]
+            if not source_days:
+                raise ValueError("账号2没有设置执行星期，无法创建转预约任务。")
+            task_status("Set", settings["at"], source_days,
+                        account=settings["from"], kind="transfer")
+
         def task():
             previous = task_status(account=self.account_index + 1)
-            previous_at = (dt.datetime.fromisoformat(previous["at"]).strftime("%H:%M")
-                           if previous["at"] else None)
-            previous_days = [name for index, (name, _) in enumerate(WEEKDAYS)
-                             if previous["daysOfWeek"] & (1 << index)]
+            previous_at, previous_days = self._task_schedule(previous)
+            previous_transfer = task_status(kind="transfer")
+            previous_transfer_at, previous_transfer_days = self._task_schedule(
+                previous_transfer)
             try:
                 write_config(updated)
-                return task_status("Set", at, task_days, account=self.account_index + 1)
+                saved = task_status("Set", at, task_days,
+                                    account=self.account_index + 1)
+                sync_transfer_task(updated)
+                return saved, task_status(kind="transfer")
             except Exception:
                 write_config(original)
                 if previous_at:
                     try:
-                        task_status("Set", previous_at, previous_days, account=self.account_index + 1)
+                        task_status("Set", previous_at, previous_days,
+                                    account=self.account_index + 1)
                     except Exception:
                         pass
+                else:
+                    # The save may have just created this account's task; undo it.
+                    try:
+                        task_status("Remove", account=self.account_index + 1)
+                    except Exception:
+                        pass
+                try:
+                    if previous_transfer_at:
+                        task_status("Set", previous_transfer_at,
+                                    previous_transfer_days, kind="transfer")
+                    else:
+                        task_status("Remove", kind="transfer")
+                except Exception:
+                    pass
                 raise
 
         def done(result):
             self.saved_username = username
+            self._update_weekday_summary()
             self._show_schedule_status(result)
             self._update_holiday_hint()
-            self.status.set("定时预约已保存；按所选星期和时间预约次日座位。")
+            self._loaded_schedule = self._schedule_state()
+            self.status.set("定时预约已保存；按所选星期和时间预约次日座位。" +
+                            ("转预约任务已同步。" if self.transfer_enabled.get() else ""))
 
         self._work(task, done, "正在保存定时预约…")
 
@@ -1486,6 +1852,26 @@ if __name__ == "__main__":
             sys.stderr = log
             try:
                 exit_code = scheduled_main()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                exit_code = 1
+            finally:
+                sys.stdout, sys.stderr = original_stdout, original_stderr
+        sys.exit(exit_code)
+    if len(sys.argv) > 1 and sys.argv[1] == "--transfer-run":
+        from transfer_seats import main as transfer_main
+
+        sys.argv.pop(1)
+        # A read-only check must not overwrite the real last-transfer.log.
+        check_only = "--check-only" in sys.argv
+        log_name = "last-transfer-check.log" if check_only else "last-transfer.log"
+        original_stdout, original_stderr = sys.stdout, sys.stderr
+        with (ROOT / log_name).open("w", encoding="utf-8") as log:
+            sys.stdout = log
+            sys.stderr = log
+            try:
+                exit_code = transfer_main()
             except Exception:
                 import traceback
                 traceback.print_exc()
