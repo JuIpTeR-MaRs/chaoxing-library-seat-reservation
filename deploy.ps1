@@ -4,6 +4,11 @@ $ErrorActionPreference = 'Stop'
 $project = $PSScriptRoot
 $venvPython = Join-Path $project '.venv\Scripts\python.exe'
 $venvPythonw = Join-Path $project '.venv\Scripts\pythonw.exe'
+$userRuntime = Join-Path $env:LOCALAPPDATA 'ChaoXingReserveSeat\venv'
+if (Test-Path -LiteralPath (Join-Path $userRuntime 'Scripts\python.exe')) {
+    $venvPython = Join-Path $userRuntime 'Scripts\python.exe'
+    $venvPythonw = Join-Path $userRuntime 'Scripts\pythonw.exe'
+}
 $localConfig = Join-Path $project 'config.local.json'
 $templateConfig = Join-Path $project 'config.json'
 

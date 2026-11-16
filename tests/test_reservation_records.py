@@ -1,10 +1,27 @@
 import unittest
 from unittest.mock import Mock
 
-from reservation_records import cancel_reservation, list_reservations
+from reservation_records import cancel_reservation, list_reservations, reservation_location
 
 
 class ReservationRecordsTest(unittest.TestCase):
+    def test_location_keeps_full_hierarchy_and_seat_leading_zeros(self):
+        self.assertEqual(reservation_location({
+            "firstLevelName": "图书馆", "secondLevelName": "三楼",
+            "thirdLevelName": "经典文库阅览学习区", "seatNum": "002"}),
+            ("图书馆 / 三楼 / 经典文库阅览学习区", "002"))
+
+    def test_location_omits_empty_levels(self):
+        self.assertEqual(reservation_location({
+            "firstLevelName": " 图书馆 ", "secondLevelName": None,
+            "thirdLevelName": "阅览区", "seatNum": 0}), ("图书馆 / 阅览区", "0"))
+
+    def test_location_falls_back_when_names_are_missing(self):
+        self.assertEqual(reservation_location({"roomName": "北区", "seatNum": "010"}),
+                         ("北区", "010"))
+        self.assertEqual(reservation_location({"roomId": 11031}), ("区域 11031", "未知座位"))
+        self.assertEqual(reservation_location({}), ("未知区域", "未知座位"))
+
     def test_list_uses_account_session_and_reads_records(self):
         client = Mock()
         client.requests.get.return_value.json.return_value = {

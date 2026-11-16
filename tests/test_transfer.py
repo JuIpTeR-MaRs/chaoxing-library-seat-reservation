@@ -135,7 +135,18 @@ class TransferTestBase(unittest.TestCase):
             return None
         return [dict(record) for record in self.school.records_of(client.username)]
 
+    def seed_evidence(self):
+        import scheduled_provenance as provenance
+        data = {"version": 1, "accounts": {}}
+        for user in self.config["reserve"]:
+            data["accounts"][provenance.identity(user["username"])] = {
+                "date": str(DAY), "records": [provenance.fingerprint(r)
+                    for r in self.school.records_of(user["username"])]}
+        self.config_path.with_name(provenance.STATE).write_text(json.dumps(data), encoding="utf-8")
+
     def run_transfer(self, **kwargs):
+        if kwargs.pop("seed_evidence", True):
+            self.seed_evidence()
         factory = kwargs.pop("client_factory",
                              lambda username, password, day: FakeClient(username,
                                                                         self.school))
@@ -145,6 +156,64 @@ class TransferTestBase(unittest.TestCase):
 
     def parsed_events(self):
         return [json.loads(event) for event in self.events]
+
+
+class ProvenanceGateTests(TransferTestBase):
+    def setUp(self):
+        super().setUp()
+        self.source = self.school.add("u2", "11031", "142", "11:00", "22:00")
+
+    def test_missing_evidence_including_force_and_preview(self):
+        for options in ({}, {"force": True}, {"check_only": True}):
+            result = self.run_transfer(seed_evidence=False, **options)
+            self.assertEqual(result["result"], "skipped")
+            self.assertEqual(self.school.cancelled, [])
+            self.assertEqual(self.school.submitted, [])
+
+    def test_changed_record_and_account_are_rejected(self):
+        for key, value in (("id", 999), ("seatNum", "999"), ("roomId", "999"),
+                           ("endTime", epoch(DAY, "23:00"))):
+            self.seed_evidence()
+            previous = self.source[key]
+            self.source[key] = value
+            self.assertEqual(self.run_transfer(seed_evidence=False)["result"], "skipped")
+            self.source[key] = previous
+        self.seed_evidence()
+        self.config["reserve"][1]["username"] = "different"
+        self.assertEqual(self.run_transfer(seed_evidence=False)["result"], "skipped")
+        self.assertEqual(self.school.cancelled, [])
+
+    def test_manual_target_conflict_blocks_entire_transfer(self):
+        self.seed_evidence()
+        self.school.add("u1", "11031", "144", "11:00", "15:00")
+        self.assertEqual(self.run_transfer(seed_evidence=False)["result"], "skipped")
+        self.assertEqual(self.school.cancelled, [])
+        self.assertEqual(self.school.submitted, [])
+
+    def test_corrupt_evidence_is_rejected(self):
+        import scheduled_provenance as provenance
+        self.config_path.with_name(provenance.STATE).write_text("{broken", encoding="utf-8")
+        self.assertEqual(self.run_transfer(seed_evidence=False)["result"], "skipped")
+        self.assertEqual(self.school.cancelled, [])
+
+
+class ProvenanceCaptureTests(unittest.TestCase):
+    def test_only_new_fully_submitted_records_get_evidence(self):
+        import scheduled_provenance as provenance
+        school = FakeSchool()
+        record = school.add("u2", "11031", "0142", "11:00", "15:00")
+        attempt = {"day": str(DAY), "roomId": "11031", "seatNum": "0142",
+                   "startTime": "11:00", "endTime": "15:00"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.local.json"
+            for before, attempts, expected in (([], [attempt], True),
+                    (None, [attempt], False), ([record], [attempt], False),
+                    ([], [], False), ([], [{**attempt, "endTime": "14:00"}], False)):
+                provenance.save(path, "u2", DAY, before, attempts, [record])
+                self.assertEqual(provenance.eligible(provenance.read(path), "u2", DAY, record), expected)
+            old = {**record, "id": 99, "endTime": epoch(DAY, "12:00")}
+            provenance.save(path, "u2", DAY, [old], [attempt], [record])
+            self.assertFalse(provenance.eligible(provenance.read(path), "u2", DAY, record))
 
 
 class SettingsTests(unittest.TestCase):
@@ -220,14 +289,14 @@ class DecisionTests(TransferTestBase):
         # cancelled first; the submits therefore only come from u1.
         self.assertEqual({item[0] for item in self.school.submitted}, {"u1"})
 
-    def test_account1_complete_wins_even_when_account2_is_partial(self):
-        """User rule: account 1 complete means only account 2's records go."""
+    def test_partial_source_is_not_cancelled_even_when_target_complete(self):
+        """Only a fully booked scheduled source can enable transfer actions."""
         self.school.add("u1", "11031", "144", "11:00", "22:00")
         account2 = self.school.add("u2", "11031", "142", "11:00", "15:00")
         result = self.run_transfer()
-        self.assertEqual(result["mode"], "cancel_source")
-        self.assertEqual(result["result"], "complete")
-        self.assertEqual(self.school.cancelled, [("u2", str(account2["id"]))])
+        self.assertEqual(result["mode"], "none")
+        self.assertEqual(result["result"], "skipped")
+        self.assertEqual(self.school.cancelled, [])
         self.assertEqual(self.school.submitted, [])
 
     def test_cross_window_target_record_keeps_its_outside_part(self):

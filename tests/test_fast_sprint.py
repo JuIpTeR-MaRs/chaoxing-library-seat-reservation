@@ -128,8 +128,8 @@ class PatientSubmitTests(unittest.TestCase):
         client = FakeClient(["ok", "timeout", "ok", "ok"], records=[])
         covered, events = run(client, submit_timeout=runner.PATIENT_SUBMIT_TIMEOUT,
                               verify_timeout=runner.VERIFY_TIMEOUT)
-        self.assertEqual({submit["timeout"] for submit in client.submits},
-                         {runner.PATIENT_SUBMIT_TIMEOUT})
+        self.assertEqual([submit["timeout"] for submit in client.submits],
+                         [runner.PATIENT_SUBMIT_TIMEOUT] * 3 + [20.0])
         index_calls = [call for call in client.requests.calls
                        if "/data/apps/seat/index" in call["url"]]
         self.assertEqual(index_calls[0]["timeout"], runner.VERIFY_TIMEOUT)
@@ -155,6 +155,34 @@ class FastModeTests(unittest.TestCase):
 
 
 class FastRaceTests(unittest.TestCase):
+    def test_other_seat_coverage_does_not_confirm_attempted_seat(self):
+        begin, end = runner.chunk_bounds(["18:00", "22:00"], "2026-11-05")
+        client = FakeClient(["timeout", "ok", "ok"], records=[{
+            "id": 42, "roomId": "11031", "seatNum": "142",
+            "startTime": begin, "endTime": end}])
+        covered, events = run(client)
+        attempts = [e for e in events if e.get("time") == ["18:00", "22:00"]
+                    and "success" in e]
+        self.assertEqual(len(attempts), 1)
+        self.assertFalse(attempts[0]["success"])
+        self.assertEqual(attempts[0]["seatid"], ["144"])
+        self.assertIn((1080, 1320), covered)
+        self.assertEqual(len(client.submits), 3)
+
+    def test_submit_budgets_allow_observed_slow_responses(self):
+        self.assertEqual(runner.submit_timeouts({})[0], 8)
+        self.assertGreater(runner.submit_timeouts({"patientSubmit": True})[0],
+                           runner.submit_timeouts({})[0])
+
+    def test_congestion_retry_waits_longer_after_all_initial_slots(self):
+        client = FakeClient(["timeout", "ok", "ok", "ok"], records=[])
+        _, events = run(client)
+        self.assertEqual([s["timeout"] for s in client.submits], [8, 8, 8, 15])
+        self.assertEqual([s["times"] for s in client.submits], [
+            ["18:00", "22:00"], ["14:00", "18:00"],
+            ["10:00", "14:00"], ["18:00", "22:00"]])
+        self.assertTrue(any(e.get("progress") == "retry_missing" for e in events))
+
     def test_fires_evening_chunks_before_morning_ones(self):
         client = FakeClient(["ok", "ok", "ok"])
         covered, events = run(client)
@@ -168,7 +196,7 @@ class FastRaceTests(unittest.TestCase):
                          [["18:00", "22:00"], ["14:00", "18:00"], ["10:00", "14:00"]])
 
     def test_timeout_is_verified_and_confirmed_without_retry(self):
-        records = [{"id": 7, "startTime": runner.chunk_bounds(["14:00", "18:00"], "2026-11-05")[0],
+        records = [{"id": 7, "roomId": "11031", "seatNum": "144", "startTime": runner.chunk_bounds(["14:00", "18:00"], "2026-11-05")[0],
                     "endTime": runner.chunk_bounds(["14:00", "18:00"], "2026-11-05")[1]}]
         client = FakeClient(["ok", "timeout", "ok"], records=records)
         covered, events = run(client)
@@ -297,7 +325,7 @@ class VerifyRetryTests(unittest.TestCase):
             {"plan": 2, "roomid": "11031", "seatid": ["143"],
              "segments": [["10:00", "14:00"], ["14:00", "18:00"], ["18:00", "22:00"]]},
         ]
-        client = FakeClient(["timeout"] * 6 +
+        client = FakeClient(["timeout"] * 3 +
                             ["msg:当前时间段您已有预约，请选择其他时间段"] * 3,
                             verify_fails=True)
         events = []
@@ -307,7 +335,7 @@ class VerifyRetryTests(unittest.TestCase):
             now_fn=lambda: dt.datetime.combine(dt.date.today(), dt.time(21, 59, 58)),
             sleep_fn=lambda _seconds: None)
         logged = [json.loads(event) for event in events]
-        self.assertEqual(len(client.submits), 9)       # 6 sprint + 3 retries
+        self.assertEqual(len(client.submits), 6)       # 3 sprint + 3 retries
         self.assertEqual(len([e for e in logged
                               if e.get("progress") == "retry_unverified"]), 3)
         self.assertEqual(sorted(covered), [(600, 840), (840, 1080), (1080, 1320)])
@@ -368,7 +396,7 @@ class ChunkMatchTests(unittest.TestCase):
 class ReconcileTests(unittest.TestCase):
     @staticmethod
     def _record(start, end):
-        return {"id": 1,
+        return {"id": 1, "roomId": "11031", "seatNum": "144",
                 "startTime": runner.chunk_bounds([start, end], "2026-11-05")[0],
                 "endTime": runner.chunk_bounds([start, end], "2026-11-05")[1]}
 

@@ -3,6 +3,21 @@
 BASE = "https://office.chaoxing.com/data/apps/seat"
 
 
+def reservation_location(record):
+    """Return the full room hierarchy and the seat label without losing zeros."""
+    parts = [str(record.get(key) or "").strip() for key in
+             ("firstLevelName", "secondLevelName", "thirdLevelName")]
+    area = " / ".join(part for part in parts if part)
+    if not area:
+        area = str(record.get("roomName") or "").strip()
+    if not area:
+        room_id = record.get("roomId")
+        area = f"区域 {room_id}" if room_id is not None else "未知区域"
+    seat = record.get("seatNum")
+    seat = str(seat).strip() if seat is not None else ""
+    return area, seat or "未知座位"
+
+
 def _response_json(response):
     response.raise_for_status()
     payload = response.json()

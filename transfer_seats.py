@@ -29,6 +29,7 @@ import sys
 import time
 from pathlib import Path
 
+import scheduled_provenance as provenance
 from reservation_records import cancel_reservation
 from reserve_segments import (
     LOCAL_TZ,
@@ -37,6 +38,8 @@ from reserve_segments import (
     current_reservations,
     emit_line,
     exclusive_file_lock,
+    login_with_retry,
+    trace_http_timings,
     reservation_fid_enc,
     reservation_plans,
     submit_chunk,
@@ -132,6 +135,7 @@ def usable_records(records, target_day):
         if span is None:
             continue
         parsed.append({
+            "raw": record,
             "id": record.get("id"),
             "span": span,
             "roomid": str(record.get("roomId") or "").strip(),
@@ -161,8 +165,10 @@ def _login_client(username, password, target_day):
     tomorrow = dt.date.today() + dt.timedelta(days=1)
     client = reserve(sleep_time=0.2, max_attempt=2, enable_slider=True,
                      reserve_next_day=(target_day == tomorrow))
-    client.get_login_status()
-    logged_in, message = client.login(username, password)
+    trace_http_timings(client.requests)
+    logged_in, message = login_with_retry(
+        client, {"username": username, "password": password}, {},
+        deadline=dt.datetime.now() + dt.timedelta(seconds=30))
     if not logged_in:
         raise TransferUnavailable(f"登录失败：{message or '未知原因'}")
     client.requests.headers.update({"Host": "office.chaoxing.com"})
@@ -480,6 +486,22 @@ def transfer_day(config, config_path, target_day, *, settings=None, emit=emit_li
     _fill_account(result, "source", source_state)
     _fill_account(result, "target", target_state)
     mode = _decide(source_state, target_state)
+    evidence = provenance.read(config_path)
+    source_records = [r for r in source_state["usable"] if overlaps_window(r, window)]
+    target_records = [r for r in target_state["usable"] if overlaps_window(r, window)]
+    required = [(source_user, source_records)]
+    if mode == "transfer":
+        required.append((target_user, target_records))
+    untrusted = any(not provenance.eligible(evidence, user["username"], target_day, r["raw"])
+                    for user, records in required for r in records)
+    if mode != "none" and (not source_records or untrusted
+                            or source_state["verified"] != "complete"):
+        result["message"] = "仅处理定时预约成功记录：缺少来源凭据、记录已变化或来源未约满，已跳过"
+        if check_only:
+            emit(json.dumps({"transfer": "plan", "mode": "none", "cancels": [],
+                             "books": [], "rebooks_outside": []}, ensure_ascii=True))
+        emit(json.dumps(result, ensure_ascii=True))
+        return result
     result["mode"] = mode
     emit(json.dumps({"transfer": "state", "date": str(target_day), "mode": mode,
                      "window": window, "source": result["source"],

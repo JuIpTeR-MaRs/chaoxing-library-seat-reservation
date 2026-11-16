@@ -196,6 +196,14 @@ SPRINT_TOKEN_LEAD = 4.0
 SPRINT_CAPTCHA_LEAD = 2.5
 SPRINT_FIRE_AFTER = 0.3
 
+# A login-page redirect loop is normally a short-lived network/proxy or site
+# hiccup. The nightly task starts a minute before the opening, so retry with a
+# clean HTTP session until shortly after the opening instead of aborting five
+# seconds in (2026-11-13: both accounts died on TooManyRedirects at 21:59).
+LOGIN_RETRY_SECONDS = 90.0
+LOGIN_RETRY_AFTER_OPENING = 30.0
+LOGIN_RETRY_MAX_SLEEP = 5.0
+
 SEAT_TAKEN_MARKERS = ("已被预约", "已经预约", "已预约", "已被占用", "已占用", "冲突")
 SEAT_HELD_MARKERS = ("已有预约",)
 TRANSIENT_SUBMIT_MARKERS = ("页面停留过久", "安全验证已超时")
@@ -318,14 +326,14 @@ def prepare_sprint(client, plans, evening_first, target_start, target_end, confi
 # reusing a single captcha result for every chunk.
 
 FAST_SPRINT_KEY = "fastSprint"
-FAST_SUBMIT_TIMEOUT = 4.0
+FAST_SUBMIT_TIMEOUT = 8.0
 
 # Per-account opt-in: wait for the submit answer before fetching the next seat
 # page.  The school voids a page token as soon as the seat page is fetched again,
 # so a 4s cut-off followed by an immediate refetch can kill a submit that is
 # still queued server-side.  Only accounts with ``patientSubmit: true`` wait.
 PATIENT_SUBMIT_KEY = "patientSubmit"
-PATIENT_SUBMIT_TIMEOUT = 8.0
+PATIENT_SUBMIT_TIMEOUT = 12.0
 
 # The post-race check is the only trustworthy source, so it must not be cut
 # short per account: on 2026-11-12 a 2s budget lost a query that answered in
@@ -343,8 +351,8 @@ def fast_mode(user):
 def submit_timeouts(user):
     """(submit, verify) seconds for one account.
 
-    ``patientSubmit`` only changes how long a submit waits for its answer (8s vs
-    4s), so the two settings can still be compared side by side in the same
+    ``patientSubmit`` only changes how long a submit waits for its answer (12s vs
+    8s), so the two settings can still be compared side by side in the same
     night.  The post-race check always gets ``VERIFY_TIMEOUT``: it runs after the
     race, so waiting longer costs nothing, while a false "check failed" makes the
     run report the opposite of what actually happened.
@@ -527,8 +535,9 @@ def verify_account_reservations(config, index, user, target_day, emit=emit_line,
         event["target"] = [start, end]
         client = reserve(sleep_time=0.2, max_attempt=1, enable_slider=True,
                          reserve_next_day=False)
-        client.get_login_status()
-        logged_in, message = client.login(user["username"], user["password"])
+        trace_http_timings(client.requests)
+        logged_in, message = login_with_retry(
+            client, user, {}, deadline=dt.datetime.now() + dt.timedelta(seconds=30))
         if not logged_in:
             event.update(verified="unavailable", error="LoginFailed",
                          message=message or "登录失败")
@@ -595,7 +604,7 @@ def _chunk_event(target_day, plan, chunk, result):
 
 def _race_pass(client, plans, target_start, target_end, covered, captcha,
                target_day, emit, tried, deferred, on_success=None,
-               submit_timeout=FAST_SUBMIT_TIMEOUT):
+               submit_timeout=FAST_SUBMIT_TIMEOUT, priority_start=None):
     """Fire every chunk once, in time order, without waiting for retries.
 
     Returns ``covered`` (scheduling coverage), ``deferred`` (timed-out chunks),
@@ -611,10 +620,11 @@ def _race_pass(client, plans, target_start, target_end, covered, captcha,
             continue
         start_text = f"{window_start // 60:02d}:{window_start % 60:02d}"
         end_text = f"{window_end // 60:02d}:{window_end % 60:02d}"
-        # Afternoon/evening slots vanish first, so book them before the morning ones.
-        # Reversing the 4h chunks keeps the segmentation intact (no 1h tail).
-        for chunk in reversed(uncovered_segments(start_text, end_text, covered)):
+        for chunk in fast_ordered_segments(start_text, end_text, covered, priority_start):
             key = (chunk[0], chunk[1], str(plan["roomid"]), str(plan["seatid"][0]))
+            # Do not resubmit an unresolved slot on every backup seat.
+            if any(chunk == pending for pending, _plan, _result in deferred):
+                continue
             if key in tried:
                 continue
             tried.add(key)
@@ -681,7 +691,7 @@ def fast_race(client, config, plans, target_start, target_end, target_day,
     """Sprint at the opening, then read the real reservations once and retry only those.
 
     ``submit_timeout``/``verify_timeout`` make the waiting configurable per account
-    (see ``submit_timeouts``): the submit wait defaults to 4s (8s for a patient
+    (see ``submit_timeouts``): the submit wait defaults to 8s (12s for a patient
     account), while the post-race check always waits ``VERIFY_TIMEOUT`` because
     it runs after the race and a false "check failed" is worse than the seconds
     it costs.
@@ -698,6 +708,7 @@ def fast_race(client, config, plans, target_start, target_end, target_day,
     lead = sprint_window(opening, now_fn)
     if lead is not None and lead > SPRINT_WINDOW_MAX:
         return None
+    client.requests.seat_page_timeout = 10.0
     captcha = ""
     if lead is not None:
         if lead > SPRINT_CAPTCHA_LEAD:
@@ -716,7 +727,11 @@ def fast_race(client, config, plans, target_start, target_end, target_day,
 
     covered, deferred, confirmed, held, rejected = _race_pass(
         client, plans, target_start, target_end, [], captcha, target_day, emit,
-        set(), [], on_success=on_success, submit_timeout=submit_timeout)
+        set(), [], on_success=on_success, submit_timeout=submit_timeout,
+        priority_start=config.get("fastPriorityStart"))
+    # After all initial slots have had a chance, prioritize reliable answers.
+    submit_timeout = 20.0 if submit_timeout >= PATIENT_SUBMIT_TIMEOUT else 15.0
+    client.requests.seat_page_timeout = 20.0
     unknown_spans = [chunk for chunk, _plan, _result in deferred]
     # One read of the real reservations decides what actually landed; it runs after
     # every chunk has been fired, so it never delays the race itself.
@@ -726,7 +741,11 @@ def fast_race(client, config, plans, target_start, target_end, target_day,
     retry = []
     if deferred:
         for chunk, plan, result in deferred:
-            landed = records is not None and chunk_landed(chunk, target_day, records)
+            # Coverage of a timeslot does not identify the attempted seat.
+            matching = [record for record in records or []
+                        if str(record.get("roomId", "")) == str(plan["roomid"])
+                        and str(record.get("seatNum", "")) == str(plan["seatid"][0])]
+            landed = records is not None and chunk_landed(chunk, target_day, matching)
             if landed:
                 result.update(success=True, outcome="confirmed", reason=None,
                               message="提交超时，核对后确认已生效")
@@ -740,7 +759,9 @@ def fast_race(client, config, plans, target_start, target_end, target_day,
                 retry.append((chunk, plan))
             else:
                 result.update(outcome="rejected",
-                              message="提交超时且核对未查到预约")
+                              message=("该时段已有其他座位预约，本次座位未确认"
+                                       if chunk_landed(chunk, target_day, records)
+                                       else "提交超时且核对未查到预约"))
             emit(json.dumps(_chunk_event(target_day, plan, chunk, result),
                             ensure_ascii=True))
         emit(json.dumps({"verify": "checked" if records is not None else "unavailable",
@@ -955,6 +976,14 @@ def uncovered_segments(start, end, covered):
                                           f"{gap_end // 60:02d}:{gap_end % 60:02d}")]
 
 
+def fast_ordered_segments(start, end, covered, priority_start=None):
+    """Move the configured starting slot first, preserving the remaining order."""
+    segments = list(reversed(uncovered_segments(start, end, covered)))
+    if priority_start:
+        segments.sort(key=lambda chunk: chunk[0] != priority_start)
+    return segments
+
+
 def ordered_uncovered_segments(start, end, covered, evening_first=False):
     """Prioritize slots from 15:00 onward without changing the target window."""
     if not evening_first or time_minutes(end) <= time_minutes(AFTERNOON_START):
@@ -989,7 +1018,7 @@ def trace_http_timings(session):
 
     def timed_request(method, url, *args, **kwargs):
         deadline = time.monotonic() + 60
-        kwargs.setdefault("timeout", 10)
+        kwargs.setdefault("timeout", getattr(session, "seat_page_timeout", 10) if urlsplit(url).path == "/front/third/apps/seat/code" else 10)
         attempt = 0
         while True:
             attempt += 1
@@ -1024,6 +1053,139 @@ def trace_http_timings(session):
             time.sleep(min(0.5 * attempt, 3, max(0, deadline - time.monotonic())))
 
     session.request = timed_request
+
+
+def login_retry_deadline(config, now_fn=dt.datetime.now):
+    """Latest local datetime at which a transient login failure is retried.
+
+    The nightly task starts a minute before the opening, so a redirect loop that
+    clears within that minute is worth riding out: the window ends shortly after
+    the opening. A run far from the opening (a manual run) gets a fixed window
+    instead of waiting for hours.
+    """
+    now = now_fn()
+    deadline = now + dt.timedelta(seconds=LOGIN_RETRY_SECONDS)
+    opening = sprint_opening(config)
+    if opening is not None:
+        grace = opening + dt.timedelta(seconds=LOGIN_RETRY_AFTER_OPENING)
+        if now <= grace:
+            deadline = min(deadline, grace)
+    return deadline
+
+
+def _retry_delay(attempt):
+    return min(float(attempt), LOGIN_RETRY_MAX_SLEEP)
+
+
+def _redirect_hops(error, limit=5):
+    """The tail of a redirect chain, so the next loop can be diagnosed."""
+    response = getattr(error, "response", None)
+    history = list(getattr(response, "history", None) or [])
+    hops = []
+    for item in history[-limit:]:
+        target = (item.headers or {}).get("Location") or item.url
+        hops.append(f"{item.status_code} {str(target)[:160]}")
+    return hops
+
+
+def _log_login_timing(name, started):
+    print(json.dumps({"timing": name, "elapsed_ms":
+                      round((time.perf_counter() - started) * 1000)}), flush=True)
+
+
+@contextmanager
+def _login_request_budget(session, remaining):
+    """Bound each redirect hop and leave retries to the outer login loop."""
+    original_send = getattr(session, "send", None)
+    previous_attempts = getattr(session, "temporary_retry_attempts", None)
+    session.temporary_retry_attempts = 1
+    expires = time.monotonic() + remaining
+
+    def send(request, **kwargs):
+        budget = expires - time.monotonic()
+        if budget <= 0:
+            raise requests.exceptions.Timeout("Login retry deadline reached")
+        from urllib3.util import Timeout
+        kwargs["timeout"] = Timeout(total=budget, connect=min(10, budget),
+                                    read=min(10, budget))
+        return original_send(request, **kwargs)
+
+    if original_send is not None:
+        session.send = send
+    try:
+        yield
+    finally:
+        if original_send is not None:
+            session.send = original_send
+        if previous_attempts is None:
+            del session.temporary_retry_attempts
+        else:
+            session.temporary_retry_attempts = previous_attempts
+
+
+def login_with_retry(client, user, config, fast_sprint=False, deadline=None,
+                     now_fn=dt.datetime.now, sleep_fn=time.sleep,
+                     session_factory=requests.session):
+    """Log in, retrying transient HTTP failures with a fresh HTTP session.
+
+    ``TooManyRedirects`` is a response-level failure: on 2026-11-13 the login
+    page bounced 30 times inside one cookie jar and the whole nightly run died
+    five seconds before the opening. A fresh session clears any cookie that
+    keeps the loop going, and the retry window reaches past the opening so a
+    late recovery can still race. A credential rejection (``login_ok`` false)
+    is a definitive answer and is returned untouched.
+    """
+    if deadline is None:
+        deadline = login_retry_deadline(config, now_fn)
+    attempt = 0
+    failure = requests.exceptions.Timeout("Login retry deadline reached")
+    while True:
+        remaining = (deadline - now_fn()).total_seconds()
+        if remaining <= 0:
+            print(json.dumps({"login_ok": False,
+                              "message": f"{type(failure).__name__}: {failure}"}), flush=True)
+            raise failure
+        attempt += 1
+        started = time.perf_counter()
+        try:
+            with _login_request_budget(client.requests, remaining):
+                client.get_login_status()
+                _log_login_timing("login_page", started)
+                started = time.perf_counter()
+                # The page request may have consumed the whole window.
+                if now_fn() >= deadline:
+                    raise requests.exceptions.Timeout("Login retry deadline reached")
+                login_ok, message = client.login(user["username"], user["password"])
+        except requests.exceptions.RequestException as error:
+            failure = error
+        else:
+            _log_login_timing("login", started)
+            return login_ok, message
+        delay = _retry_delay(attempt)
+        remaining = (deadline - now_fn()).total_seconds()
+        entry = {"progress": "login_retry", "attempt": attempt,
+                 "error": type(failure).__name__, "detail": str(failure)[:200]}
+        hops = _redirect_hops(failure)
+        if hops:
+            entry["redirects"] = hops
+        print(json.dumps(entry, ensure_ascii=True), flush=True)
+        if remaining <= 0:
+            print(json.dumps({"login_ok": False,
+                              "message": f"{type(failure).__name__}: {failure}"},
+                             ensure_ascii=True), flush=True)
+            raise failure
+        sleep_fn(min(delay, remaining))
+        if now_fn() >= deadline:
+            continue
+        session = session_factory()
+        if fast_sprint:
+            session.temporary_retry_attempts = 1
+        trace_http_timings(session)
+        old_session = client.requests
+        client.requests = session
+        close = getattr(old_session, "close", None)
+        if close is not None:
+            close()
 
 
 def update_holidays(args, emit=emit_line):
@@ -1233,7 +1395,8 @@ def run_account(args, config, user, on_success=None, outcome=None):
                 continue
             start_text = f"{window_start // 60:02d}:{window_start % 60:02d}"
             end_text = f"{window_end // 60:02d}:{window_end % 60:02d}"
-            segments = (list(reversed(uncovered_segments(start_text, end_text, [])))
+            segments = (fast_ordered_segments(start_text, end_text, [],
+                                               config.get("fastPriorityStart"))
                         if fast else
                         ordered_uncovered_segments(start_text, end_text, [],
                                                    evening_first and plan["roomid"] == CLASSIC_ROOM_ID))
@@ -1306,29 +1469,47 @@ def run_account(args, config, user, on_success=None, outcome=None):
         client.requests.temporary_retry_attempts = 1
     trace_http_timings(client.requests)
     print(json.dumps({"progress": "logging_in", "date": str(target_day)}, ensure_ascii=True), flush=True)
-    started = time.perf_counter()
-    client.get_login_status()
-    print(json.dumps({"timing": "login_page", "elapsed_ms":
-                      round((time.perf_counter() - started) * 1000)}), flush=True)
-    started = time.perf_counter()
-    login_ok, message = client.login(user["username"], user["password"])
-    print(json.dumps({"timing": "login", "elapsed_ms":
-                      round((time.perf_counter() - started) * 1000)}), flush=True)
+    login_ok, message = login_with_retry(client, user, config, fast_sprint)
     if not login_ok:
         print(json.dumps({"login_ok": False, "message": message}, ensure_ascii=True))
         return 1
 
     notes["attempted"] = True
     client.requests.headers.update({"Host": "office.chaoxing.com"})
+    import scheduled_provenance as provenance
+    provenance_before = None
+    provenance_attempts = []
+    if not args.today:
+        try:
+            fid = (reservation_fid_enc(client, plans[0]["roomid"], target_day)
+                   or user.get("deptIdEnc") or config.get("deptIdEnc"))
+            provenance_before = current_reservations(client, fid, timeout=10)
+        except Exception:
+            pass
     original_post = client.requests.post
     submit_response = None
 
     def capture_submit(*args, **kwargs):
         nonlocal submit_response
-        response = original_post(*args, **kwargs)
         url = kwargs.get("url") or (args[0] if args else "")
-        if "/seat/submit" in url:
+        is_submit = "/seat/submit" in url
+        params = kwargs.get("params")
+        attempt = ({key: params.get(key) for key in
+                    ("roomId", "seatNum", "day", "startTime", "endTime")}
+                   if is_submit and isinstance(params, dict) else None)
+        try:
+            response = original_post(*args, **kwargs)
+        except requests.exceptions.Timeout:
+            if attempt is not None:
+                provenance_attempts.append(attempt)
+            raise
+        if is_submit:
             submit_response = response
+            try:
+                if response.json().get("success") is True and attempt is not None:
+                    provenance_attempts.append(attempt)
+            except (ValueError, AttributeError):
+                pass
         return response
 
     client.requests.post = capture_submit
@@ -1421,6 +1602,15 @@ def run_account(args, config, user, on_success=None, outcome=None):
                     if on_success is not None:
                         on_success()
                     covered.append((time_minutes(start), time_minutes(end)))
+    if not args.today:
+        try:
+            after = current_reservations(client, fid, timeout=10) if provenance_before is not None else None
+            with exclusive_file_lock(Path(args.user).with_name("scheduled-provenance.lock")):
+                provenance.save(args.user, user["username"], target_day,
+                                provenance_before, provenance_attempts, after)
+        except Exception as error:
+            print(json.dumps({"warning": "定时预约来源凭据写入失败，转预约将跳过无法核对的记录",
+                              "error": type(error).__name__}, ensure_ascii=True), flush=True)
     missing = uncovered_segments(target_start, target_end, covered)
     if not missing:
         print(json.dumps({"status": "complete", "target": [target_start, target_end]}), flush=True)

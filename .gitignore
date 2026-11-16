@@ -145,3 +145,10 @@ dmypy.json
 .pyre/
 test.json
 tests/manual_*.py
+
+scheduled-provenance.json
+scheduled-provenance.tmp
+scheduled-provenance.lock
+pod-team.lock
+pod-team-state.json
+pod-team-state.tmp

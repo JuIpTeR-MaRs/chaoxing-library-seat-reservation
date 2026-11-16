@@ -54,6 +54,15 @@ def base_user(**extra):
 
 
 class VerificationTests(unittest.TestCase):
+    def test_verification_uses_shared_login_retry(self):
+        with mock.patch.object(runner, "login_with_retry", return_value=(False, "密码错误")) as login:
+            event, _ = self.verify([])
+        self.assertEqual(event["error"], "LoginFailed")
+        self.assertEqual(login.call_args.args[1]["username"], "u1")
+        budget = (login.call_args.kwargs["deadline"] - dt.datetime.now()).total_seconds()
+        self.assertGreater(budget, 28)
+        self.assertLessEqual(budget, 30)
+
     def verify(self, records, user=None, client=None, day=DAY):
         events = []
         with mock.patch.object(runner, "reserve", return_value=client or FakeClient()), \
